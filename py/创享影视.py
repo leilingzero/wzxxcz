@@ -184,6 +184,7 @@ class Spider(Spider):
         }
         self.default_pic = DEFAULT_PIC
         self._play_cache = {}
+        self._cur_vid = ""
         self.log("init: site=%s api=%s" % (self.site_url, self.api_url))
 
     # ------------------------------------------------------------------
@@ -201,27 +202,38 @@ class Spider(Spider):
             self.log("fetch FAIL %s -> %s" % (url[:120], e))
             return ""
 
-    def _get_json(self, params, timeout=20):
-        """请求官方采集接口，返回 dict（失败返回空 dict）"""
+    def _get_json(self, params, timeout=20, retry=2):
+        """请求官方采集接口，返回 dict（失败返回空 dict）。带重试，抗偶发超时。"""
         url = self.api_url + "?" + urllib.parse.urlencode(params)
         self.log("api: %s" % url[:220])
-        text = self._fetch_text(url, timeout=timeout)
-        if not text:
-            return {}
-        text = text.strip()
-        # 兼容 JSONP 包裹
-        if text.startswith("/**/"):
-            text = text[4:]
-        if not text.startswith("{"):
-            i, j = text.find("{"), text.rfind("}")
-            if i >= 0 and j > i:
-                text = text[i:j + 1]
-        try:
-            data = json.loads(text)
-            return data if isinstance(data, dict) else {}
-        except Exception as e:
-            self.log("json FAIL: %s | head=%s" % (e, text[:120]))
-            return {}
+
+        for attempt in range(retry + 1):
+            text = self._fetch_text(url, timeout=timeout)
+            if not text:
+                if attempt < retry:
+                    self.log("  接口无响应，重试 %d/%d" % (attempt + 1, retry))
+                    time.sleep(0.4 * (attempt + 1))
+                    continue
+                return {}
+
+            text = text.strip()
+            # 兼容 JSONP 包裹
+            if text.startswith("/**/"):
+                text = text[4:]
+            if not text.startswith("{"):
+                i, j = text.find("{"), text.rfind("}")
+                if i >= 0 and j > i:
+                    text = text[i:j + 1]
+            try:
+                data = json.loads(text)
+                return data if isinstance(data, dict) else {}
+            except Exception as e:
+                self.log("json FAIL: %s | head=%s" % (e, text[:120]))
+                if attempt < retry:
+                    time.sleep(0.4 * (attempt + 1))
+                    continue
+                return {}
+        return {}
 
     # ------------------------------------------------------------------
     # 工具
@@ -545,6 +557,8 @@ class Spider(Spider):
         if m:
             vod_id = m.group(1)
         self.log("detail: id=%s" % vod_id)
+        # 记录当前影片，供播放失败时回查其它线路
+        self._cur_vid = vod_id
 
         data = self._get_json({"ac": "detail", "ids": vod_id})
         items = data.get("list") or []
@@ -625,8 +639,11 @@ class Spider(Spider):
 
         now = int(time.time())
         if play_url in self._play_cache:
-            ts, res = self._play_cache[play_url]
-            if now - ts < 600:
+            item = self._play_cache[play_url]
+            ts, res = item[0], item[1]
+            alive = item[2] if len(item) > 2 else True
+            # 只复用「确认可用」的缓存；死线路每次重探，避免源站恢复后仍播旧结果
+            if alive and now - ts < 600:
                 return res
 
         header = {
@@ -638,22 +655,242 @@ class Spider(Spider):
         if "/ts-proxy/" in play_url:
             play_url = self._unwrap_proxy(play_url)
 
-        # m3u8 / mp4 直链：交由播放器直接播放
         low = play_url.lower()
-        if ".m3u8" in low or ".mp4" in low or ".flv" in low:
-            res = {
-                "parse": 0,
-                "playUrl": "",
-                "url": play_url,
-                "header": header,
-            }
-            self._play_cache[play_url] = (now, res)
+        if not (".m3u8" in low or ".mp4" in low or ".flv" in low):
+            # 其它（如需解析的网页地址）交给 TVBox 嗅探
+            res = {"parse": 1, "playUrl": "", "url": play_url, "header": header}
+            self._play_cache[play_url] = (now, res, False)
             return res
 
-        # 其它（如需要解析的网页地址）交给 TVBox 嗅探
-        res = {"parse": 1, "playUrl": "", "url": play_url, "header": header}
-        self._play_cache[play_url] = (now, res)
+        # ---- 播放前探活：死线路/坏分片直接换可用线路 ----
+        final_url, final_header, alive = self._resolve_playable(flag, play_url, header)
+
+        res = {
+            "parse": 0,
+            "playUrl": "",
+            "url": final_url,
+            "header": final_header,
+        }
+        # 死线路不缓存，下次还能重新探测（源站可能恢复）
+        self._play_cache[play_url] = (now, res, alive)
+        if final_url != play_url:
+            self._play_cache[final_url] = (now, res, True)
         return res
+
+    # ---------------- 探活 & 容错 ----------------
+
+    def _http_probe(self, url, timeout=8, headers=None, want_body=True, max_bytes=262144):
+        """
+        返回 (status_code, body_text)。
+        want_body=True 时尽量读完（m3u8 文本通常几十 KB），最多 max_bytes；
+        want_body=False 时只要状态码（探 ts 分片用，省流量）。
+        """
+        h = {
+            "User-Agent": UA,
+            "Accept": "*/*",
+        }
+        if headers:
+            h.update(headers)
+        try:
+            try:
+                rsp = self.fetch(url, headers=h, timeout=timeout, stream=want_body)
+            except TypeError:
+                # 部分 TVBox 内核的 fetch 不支持 stream 参数
+                rsp = self.fetch(url, headers=h, timeout=timeout)
+            code = getattr(rsp, "status_code", 0) or 0
+
+            if not want_body:
+                # 只取状态码；顺手关闭连接
+                try:
+                    if hasattr(rsp, "close"):
+                        rsp.close()
+                except Exception:
+                    pass
+                return code, ""
+
+            body = ""
+            try:
+                if hasattr(rsp, "raw") and hasattr(rsp.raw, "read"):
+                    buf = b""
+                    while len(buf) < max_bytes:
+                        chunk = rsp.raw.read(16384)
+                        if not chunk:
+                            break
+                        buf += chunk
+                        # m3u8 已完整（有分片行）就没必要继续
+                        if b"#EXTINF" in buf and len(buf) > 2048:
+                            break
+                    body = buf.decode("utf-8", "ignore") if isinstance(buf, bytes) else str(buf)
+            except Exception:
+                body = ""
+            if not body and hasattr(rsp, "text"):
+                body = (rsp.text or "")[:max_bytes]
+            return code, body
+        except Exception as e:
+            self.log("  probe fail %s -> %s" % (url[:80], e))
+            return 0, ""
+
+    def _m3u8_alive(self, url, timeout=8, headers=None):
+        """
+        判断一个 m3u8 是否可播：
+          1) HTTP 200 且含 #EXTM3U
+          2) 若是 master，取第一个子列表再判
+          3) 取第一个真实分片（跳过广告占位 ts1.*.com/index*.ts 之类）探活
+        返回 (ok, 可能需要替换的 url)
+        """
+        code, body = self._http_probe(url, timeout=timeout, headers=headers)
+        if code != 200 or "#EXTM3U" not in body:
+            return False, url
+
+        # 统一换行，去掉 \r
+        body = body.replace("\r\n", "\n").replace("\r", "\n")
+        lines = [x.strip() for x in body.split("\n") if x.strip()]
+
+        # master 列表：取第一个子 m3u8（带宽最高/首个）
+        sub = ""
+        for i, ln in enumerate(lines):
+            if ln.startswith("#EXT-X-STREAM-INF"):
+                if i + 1 < len(lines):
+                    sub = lines[i + 1]
+                break
+        if sub:
+            sub_full = self._abs_url(sub, url)
+            ok, _ = self._m3u8_alive(sub_full, timeout=timeout, headers=headers)
+            # 子列表能通即认为原 master 地址可播，保留原地址不动
+            return ok, url
+
+        # media 列表：找第一个有效分片
+        segs = [ln for ln in lines if not ln.startswith("#")]
+        if not segs:
+            return False, url
+
+        # 樱花等线路首片是广告占位死链，跳过它继续往后试
+        for seg in segs[:5]:
+            full = self._abs_url(seg, url)
+            if self._is_ad_segment(full):
+                self.log("  跳过广告占位分片: %s" % full[:80])
+                continue
+            c, _ = self._http_probe(full, timeout=timeout, headers=headers,
+                                    want_body=False)
+            if c == 200:
+                return True, url
+        return False, url
+
+    def _is_ad_segment(self, url):
+        """识别广告占位分片：ts1.xxx.com/index2.ts 这类无集数特征的地址"""
+        m = re.search(r"^https?://([^/]+)/(index\d*\.ts)$", url, re.I)
+        return bool(m)
+
+    def _abs_url(self, sub, base):
+        """
+        把 m3u8 里的相对地址解析成绝对地址。
+        base 视为「目录」(以 / 结尾) 或「文件」(自动取其目录)。
+        """
+        sub = (sub or "").strip().strip('\r\n\t ')
+        if not sub:
+            return ""
+        if sub.startswith("http://") or sub.startswith("https://"):
+            return sub
+        if sub.startswith("//"):
+            return "https:" + sub
+
+        # base 若是文件路径，先取目录
+        b = base.strip()
+        if not b.endswith("/"):
+            b = b.rsplit("/", 1)[0] + "/"
+
+        if sub.startswith("/"):
+            m = re.match(r"(https?://[^/]+)", b)
+            return (m.group(1) if m else "") + sub
+
+        # 处理 ../ 与 ./
+        parts = b.split("/")
+        scheme_host = "/".join(parts[:3])          # https://host
+        dir_parts = parts[3:]                      # 域名后的目录段
+        if dir_parts and dir_parts[-1] == "":
+            dir_parts = dir_parts[:-1]
+
+        for seg in sub.split("/"):
+            if seg == "" or seg == ".":
+                continue
+            if seg == "..":
+                if dir_parts:
+                    dir_parts.pop()
+            else:
+                dir_parts.append(seg)
+
+        return scheme_host + "/" + "/".join(dir_parts)
+
+    def _resolve_playable(self, flag, play_url, header):
+        """
+        先探当前线路；不通则回到详情里找同片其它线路，按顺序试到可用为止。
+        返回 (url, header, alive)
+        """
+        ok, url = self._m3u8_alive(play_url, headers=header)
+        if ok:
+            return url, header, True
+
+        self.log("  ⚠ 当前线路不可用，尝试切换到其它线路...")
+
+        alt = self._find_alt_episode(flag, play_url)
+        if alt:
+            for f, u in alt:
+                if u == play_url:
+                    continue
+                ok2, u2 = self._m3u8_alive(u, headers={"User-Agent": UA,
+                                                       "Referer": self.site_url + "/"})
+                if ok2:
+                    self.log("  ✓ 切换线路 [%s] 可用: %s" % (f, u2[:120]))
+                    return u2, {"User-Agent": UA, "Referer": self.site_url + "/"}, True
+
+        self.log("  未找到其它可用线路，原样返回")
+        return play_url, header, False
+
+    def _find_alt_episode(self, flag, play_url):
+        """根据当前播放地址，反查同片同集在其它线路的地址"""
+        try:
+            vid = self._cur_vid
+        except Exception:
+            vid = ""
+        if not vid:
+            return []
+
+        data = self._get_json({"ac": "detail", "ids": str(vid)})
+        items = data.get("list") or []
+        if not items:
+            return []
+        it = items[0]
+
+        # 定位当前是第几集
+        ep_index = -1
+        ep_name = ""
+        froms = str(it.get("vod_play_from") or "").split("$$$")
+        groups = str(it.get("vod_play_url") or "").split("$$$")
+        for g in groups:
+            for i, seg in enumerate(g.split("#")):
+                if "$" in seg:
+                    n, u = seg.split("$", 1)
+                else:
+                    n, u = "", seg
+                if self._fix_url(u.strip()) == play_url:
+                    ep_index = i
+                    ep_name = n
+                    break
+            if ep_index >= 0:
+                break
+
+        if ep_index < 0:
+            return []
+
+        out = []
+        for i, g in enumerate(groups):
+            f = froms[i] if i < len(froms) else ("线路%d" % (i + 1))
+            segs = g.split("#")
+            if ep_index < len(segs):
+                seg = segs[ep_index]
+                u = seg.split("$", 1)[1] if "$" in seg else seg
+                out.append((f, self._fix_url(u.strip())))
+        return out
 
     def _unwrap_proxy(self, url):
         """把 /ts-proxy/host/443/path 还原成 https://host/path"""
