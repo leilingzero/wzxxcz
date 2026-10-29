@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 影探4K (cms.lyyytv.cn) | TVBox Python 爬虫 
-由 影探4k.js 移植，风格对齐豆花电影网 Spider ：
+由 影探4k.js 移植，风格对齐豆花电影网 Spider
   - Session 连接池 + verify=False + 重试退避
   - 解析接口 fys.lyyytv.cn (parsesId=3) → https://baidu.con/ 前缀 AES/CBC 解密
   - 兼容 lvdou+ / ldmax.cooom 两种老加密前缀
@@ -85,6 +85,9 @@ FILTER_NAMES = {
 HOME_CACHE_TTL = 6 * 3600
 
 INTRO_PREFIX = '🍊小橙子为您介绍剧情👉请不要相信视频中的广告，以免上当受骗！'
+
+# 与真实网站顶部导航栏完全一致的主分类（其余 ①②③ 为站内下拉子页，不在 TVBox 展示）
+SITE_TABS = ['1', '21', '3', '25', '56', '22', '23', '24', '29']
 
 _BASE64_RE = re.compile(r'(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?')
 _LDMAX_RE = re.compile(r'^https?://ldmax\.cooom/', re.I)
@@ -334,6 +337,8 @@ def home(extend=''):
         if item.get('type_id') is None or not text(item.get('type_name')):
             continue
         tid = text(item['type_id'])
+        if tid not in SITE_TABS:
+            continue
         classes.append({'type_id': tid, 'type_name': text(item['type_name'])})
         ext = object_of(item.get('type_extend'))
         groups = []
