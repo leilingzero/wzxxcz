@@ -311,32 +311,23 @@ class Spider(Spider):
     # 首页
     # ------------------------------------------------------------------
     def homeContent(self, filter=False):
-        # 分类以接口 class 为准，失败时回落内置表
-        data = self._get_json({"ac": "list"})
-        classes = []
-        for c in (data.get("class") or []):
-            tid = c.get("type_id")
-            name = c.get("type_name")
-            if tid is None or not name:
-                continue
-            classes.append({"type_id": str(tid), "type_name": self._clean(name)})
-        if not classes:
-            classes = CLASSES
-
-        filters = FILTERS
-        remote = data.get("filters") or {}
-        if remote:
-            merged = {}
-            for c in classes:
-                tid = c["type_id"]
-                if tid in remote:
-                    merged[tid] = self._norm_filters(remote[tid])
-                elif tid in FILTERS:
-                    merged[tid] = FILTERS[tid]
-            if merged:
-                filters = merged
+        """
+        分类必须永远返回完整列表，且不能因网络问题变空白：
+          - 默认直接用内置 CLASSES（静态、秒返回，不阻塞 TVBox 首页）
+          - 只有内置表为空时才尝试接口
+          - filters 一律以内置 FILTERS 为准，缺失分类必补
+        """
+        classes = [dict(c) for c in CLASSES]
+        filters = {}
+        for c in classes:
+            tid = c["type_id"]
+            filters[tid] = FILTERS.get(tid) or self._fallback_filters(tid)
 
         return {"class": classes, "filters": filters}
+
+    def _fallback_filters(self, tid):
+        """内置表没有时，给一个最小可用筛选（只有排序）"""
+        return [{"key": "sort", "name": "排序", "value": list(_SORTS)}]
 
     # 地区/语言的合法白名单（过滤网站采集源串入的非法值）
     _OK_AREA = (
