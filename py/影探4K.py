@@ -1,23 +1,64 @@
 # -*- coding: utf-8 -*-
-# 影探4K：由 影探4k.js 移植到鱼壳 webhtv 站点注入使用的 Python Spider。
-# 用法：把本文件放到手机 /sdcard/py/影探4K.py，站点配置 api 填 file:///sdcard/py/影探4K.py
+"""
+影探4K (cms.lyyytv.cn) | TVBox Python 爬虫 
+由 影探4k.js 移植，风格对齐豆花电影网 Spider ：
+  - Session 连接池 + verify=False + 重试退避
+  - 解析接口 fys.lyyytv.cn (parsesId=3) → https://baidu.con/ 前缀 AES/CBC 解密
+  - 兼容 lvdou+ / ldmax.cooom 两种老加密前缀
+  - 解析结果缓存 + 首页缓存 + 防御式解析
+用法：把本文件放到手机 /sdcard/py/影探4K.py，站点配置 api 填 file:///sdcard/py/影探4K.py
+"""
 import base64
 import json
 import re
+import sys
 import time
 import urllib.parse
+
+try:
+    from base.spider import Spider
+except ImportError:
+    import requests as _rq
+    try:
+        import urllib3
+        urllib3.disable_warnings()
+    except Exception:
+        pass
+
+    class _BaseSpider:
+        def __init__(self):
+            self._session = None
+
+        @property
+        def _sess(self):
+            if self._session is None:
+                self._session = _rq.Session()
+                self._session.verify = False
+                adapter = _rq.adapters.HTTPAdapter(
+                    pool_connections=10, pool_maxsize=10, max_retries=0)
+                self._session.mount('https://', adapter)
+                self._session.mount('http://', adapter)
+            return self._session
+
+        def fetch(self, url, headers=None, **kw):
+            timeout = kw.pop('timeout', 15)
+            r = self._sess.get(url, headers=headers, timeout=timeout, **kw)
+            r.encoding = 'utf-8'
+            return r
+
+        def log(self, *a, **kw):
+            try:
+                print("[yingtan4k]", *a)
+            except Exception:
+                pass
+
+    Spider = _BaseSpider
 
 import requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 
-try:
-    from base.spider import Spider
-except ImportError:
-    import sys
-    sys.path.append('..')
-    from base.spider import Spider
-
+# ===================== 常量 =====================
 KEY = 'yingtan4k'
 HOST = 'http://cms.lyyytv.cn'
 CMS_KEY = 'wP5bvxoc3yv7FoBQENFZuAF0EUYr4LTy'
@@ -43,14 +84,18 @@ FILTER_NAMES = {
 }
 HOME_CACHE_TTL = 6 * 3600
 
+INTRO_PREFIX = '🍊小橙子为您介绍剧情👉请不要相信视频中的广告，以免上当受骗！'
+
 _BASE64_RE = re.compile(r'(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?')
 _LDMAX_RE = re.compile(r'^https?://ldmax\.cooom/', re.I)
 _MEDIA_RE = re.compile(r'\.(?:mp4|m3u8?|flv|avi|mkv|ts|mov|wmv|webm|m4v|mpd)$', re.I)
 
+# ===================== 模块级缓存 =====================
 _home_cache = {}
 _play_cache = {}
 
 
+# ===================== 工具函数 =====================
 def text(value):
     return '' if value is None else str(value).strip()
 
@@ -274,6 +319,7 @@ def is_media_url(url):
     return bool(_MEDIA_RE.search(urllib.parse.urlparse(text(url)).path))
 
 
+# ===================== 业务函数 =====================
 def home(extend=''):
     cache_key = '%s_home_%s' % (KEY, text(extend))
     cached = _home_cache.get(cache_key)
@@ -409,6 +455,8 @@ def detail(ids):
             urls.append(url)
         vod['vod_play_from'] = '$$$'.join(froms)
         vod['vod_play_url'] = '$$$'.join(urls)
+        content = text(vod.get('vod_content')) or text(vod.get('vod_blurb'))
+        vod['vod_content'] = (INTRO_PREFIX + '\n' + content) if content else INTRO_PREFIX
         lst.append(vod)
     return {'list': lst}
 
@@ -452,12 +500,34 @@ def play(play_id):
     return {'parse': 0, 'url': resolved or '', 'header': dict(PARSE_HEADERS)}
 
 
+# ===================== Spider 类 =====================
 class Spider(Spider):
+
     def getName(self):
         return '🎬 影探4K'
 
     def init(self, extend=''):
-        self.extend = extend or ''
+        try:
+            self.extend = json.loads(extend) if extend else {}
+        except Exception:
+            self.extend = {}
+        self._warmed = False
+        self.log("init: extend=%s" % self.extend)
+
+    def _warm_up(self):
+        if self._warmed:
+            return
+        try:
+            if hasattr(self, '_sess'):
+                self._sess.get(HOST + '/api.php/app/nav?token=',
+                               headers=HEADERS, timeout=10)
+            else:
+                requests.get(HOST + '/api.php/app/nav?token=',
+                             headers=HEADERS, timeout=10)
+            self._warmed = True
+            self.log("预热完成")
+        except Exception as e:
+            self.log("预热失败: %s" % e)
 
     def isVideoFormat(self, url):
         return is_media_url(url)
@@ -465,26 +535,63 @@ class Spider(Spider):
     def manualVideoCheck(self):
         return False
 
-    def homeContent(self, filter):
-        return home(self.extend)
+    def homeContent(self, filter=False):
+        self._warm_up()
+        return home(self.extend if isinstance(self.extend, str) else '')
 
     def homeVideoContent(self):
+        self._warm_up()
         return home_vod()
 
     def categoryContent(self, tid, pg, filter, extend):
+        self._warm_up()
+        if isinstance(extend, str):
+            try:
+                extend = json.loads(extend) if extend else {}
+            except Exception:
+                extend = {}
         return category(tid, pg, extend)
 
     def detailContent(self, ids):
         return detail(ids)
 
     def searchContent(self, key, quick, pg='1'):
+        self._warm_up()
         return search(key, pg)
 
+    def searchContentPage(self, key, quick, pg='1'):
+        return self.searchContent(key, quick, pg)
+
     def playerContent(self, flag, id, vipFlags):
+        self.log("player: flag=%s id=%s" % (flag, text(id)[:120]))
         return play(id)
 
     def localProxy(self, param):
-        return None
+        try:
+            url = ''
+            if isinstance(param, dict):
+                url = param.get('url', '')
+            else:
+                for pair in str(param).split('&'):
+                    if '=' in pair:
+                        k, v = pair.split('=', 1)
+                        if k == 'url':
+                            url = v
+            if not url:
+                return [200, 'image/jpeg', b'', '']
+            url = urllib.parse.unquote(url) if '%' in url else url
+            rsp = self.fetch(url, headers=dict(PARSE_HEADERS), timeout=15)
+            content = rsp.content
+            ctype = rsp.headers.get('Content-Type', 'image/jpeg')
+            if not ctype.startswith('image/'):
+                ctype = 'image/jpeg'
+            return [200, ctype, content, '']
+        except Exception:
+            return [200, 'image/jpeg', b'', '']
 
     def destroy(self):
-        pass
+        _home_cache.clear()
+        _play_cache.clear()
+
+    def close(self):
+        self.destroy()
