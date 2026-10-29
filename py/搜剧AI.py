@@ -215,6 +215,7 @@ class Spider(Spider):
         self._detail_cache = {}
         self._play_cache = {}
         self._lines_cache = {}
+        self._url_probe_cache = {}
         self.log("init: site=%s" % self.site_url)
 
     # ===================== 签名与请求 =====================
@@ -310,9 +311,37 @@ class Spider(Spider):
         self._lines_cache[ep_token] = lines
         return lines
 
+    def _check_url(self, url):
+        """探测直链是否可用 (部分资源站返回的直链本身是 404 死链)。
+        结果缓存 10 分钟。"""
+        now = int(time.time())
+        if url in self._url_probe_cache:
+            ts, ok = self._url_probe_cache[url]
+            if now - ts < 600:
+                return ok
+        ok = False
+        try:
+            h = {"User-Agent": UA, "Referer": self.site_url + "/"}
+            rsp = self.fetch(url, headers=h, timeout=6)
+            text = ""
+            if hasattr(rsp, "text"):
+                text = (rsp.text or "")[:300]
+            elif hasattr(rsp, "content"):
+                text = rsp.content.decode("utf-8", "ignore")[:300]
+            code = getattr(rsp, "status_code", None) or getattr(
+                rsp, "status", 0)
+            ok = (200 <= int(code or 0) < 400) and \
+                ("#EXTM3U" in text or ".m3u8" in url.lower())
+        except Exception:
+            ok = False
+        self._url_probe_cache[url] = (now, ok)
+        return ok
+
     def _pick_line(self, ep_token, flag_idx):
-        """按线路序号取线路, 返回 (label, url)。官方 ticket 线路解析失败时
-        自动兜底到第一条直链。"""
+        """按线路序号取线路, 返回 (label, url)。
+        - 直链先探测可用性, 死链(404等)自动跳到下一条线路
+        - 用户指定线路不可用时兜底到任意可用直链
+        - 官方 ticket 线路需登录权益, 失败自动降级"""
         lines = self._resolve_lines(ep_token)
         if not lines:
             return "", ""
@@ -332,28 +361,29 @@ class Spider(Spider):
                 return ""
             return u if u.startswith("http") else ""
 
-        chosen = None
+        # 候选顺序: 用户指定线路优先, 之后按权重顺序扫全部
+        order = []
         if isinstance(flag_idx, int) and 0 <= flag_idx < len(lines):
-            chosen = lines[flag_idx]
-        else:
-            for ln in lines:
-                u = (ln.get("url") or "").strip()
-                if ln.get("resolved") and ln.get("url_kind") == "m3u8" \
-                        and u.startswith("http"):
-                    chosen = ln
-                    break
-            chosen = chosen or lines[0]
+            order.append(flag_idx)
+        order += [i for i in range(len(lines)) if i != flag_idx]
 
-        if chosen is not None:
-            u = get_url(chosen)
-            if u:
-                return chosen.get("label") or chosen.get("provider_id") or "", u
+        fallback_url = ""   # 未探测过的直链, 万一全部探测失败时兜底
+        for i in order:
+            ln = lines[i]
+            u = get_url(ln)
+            if not u:
+                continue
+            if not fallback_url:
+                fallback_url = u
+            if self._check_url(u):
+                return ln.get("label") or ln.get("provider_id") \
+                    or "线路%d" % (i + 1), u
+            self.log("  线路死链跳过: %s" % (ln.get("label") or i))
 
-        # 兜底: 任意一条直链
-        for ln in lines:
-            u = (ln.get("url") or "").strip()
-            if u.startswith("http"):
-                return ln.get("label") or "", u
+        # 全部探测失败 (网络差等): 返回第一条直链让播放器自行尝试
+        if fallback_url:
+            ln = lines[order[0]] if order else lines[0]
+            return ln.get("label") or "", fallback_url
         return "", ""
 
     # ===================== TVBox 标准接口 =====================
