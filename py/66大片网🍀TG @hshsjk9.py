@@ -71,8 +71,52 @@ CLASSES = [
     {"type_id": "4", "type_name": "短剧"},
 ]
 
-# 分类页无筛选参数, 保留空筛选以兼容 UI
-FILTERS = {c["type_id"]: [] for c in CLASSES}
+# 筛选: maccms 内置 /vodtype/{tid}/class/{v}/area/{v}/year/{v}.html
+# (无效值服务端会静默降级为全部列表, 安全)
+_SORTS = [{"n": "全部", "v": ""}]
+_YEARS = [{"n": "全部", "v": ""}] + \
+         [{"n": str(y), "v": str(y)} for y in range(2026, 1999, -1)]
+_AREAS = [
+    {"n": "全部", "v": ""},
+    {"n": "中国大陆", "v": "中国大陆"}, {"n": "美国", "v": "美国"},
+    {"n": "中国香港", "v": "中国香港"}, {"n": "中国台湾", "v": "中国台湾"},
+    {"n": "韩国", "v": "韩国"}, {"n": "日本", "v": "日本"},
+    {"n": "英国", "v": "英国"}, {"n": "法国", "v": "法国"},
+    {"n": "泰国", "v": "泰国"}, {"n": "印度", "v": "印度"},
+    {"n": "其它", "v": "其它"},
+]
+_CLASSES_ALL = [
+    "剧情", "喜剧", "爱情", "动作", "悬疑", "恐怖", "科幻", "奇幻",
+    "犯罪", "惊悚", "冒险", "战争", "历史", "古装", "家庭", "纪录",
+    "动画", "音乐", "传记", "武侠", "运动", "灾难", "西部", "短片",
+]
+
+_FILTERS_MAP = {
+    "1": ["全部", "剧情", "喜剧", "爱情", "动作", "惊悚", "犯罪", "恐怖",
+          "悬疑", "冒险", "奇幻", "科幻", "家庭", "历史", "战争", "纪录",
+          "古装", "音乐", "动画", "传记", "武侠", "运动", "短片"],
+    "3": ["全部", "剧情", "喜剧", "爱情", "犯罪", "悬疑", "家庭", "古装",
+          "惊悚", "动作", "奇幻", "科幻", "都市", "历史", "战争", "冒险",
+          "武侠", "恐怖", "青春", "传记", "情感", "纪录", "军旅"],
+    "2": ["全部", "动画", "冒险", "喜剧", "奇幻", "剧情", "科幻", "动作",
+          "儿童", "悬疑", "都市", "家庭", "国漫", "日常", "爱情", "玄幻",
+          "日漫", "音乐", "治愈", "古风", "校园"],
+    "4": ["全部", "剧情", "爱情", "古装", "悬疑", "喜剧", "奇幻", "都市",
+          "玄幻", "犯罪", "家庭", "穿越", "惊悚", "武侠", "科幻", "动作",
+          "冒险", "恐怖", "青春", "历史"],
+    "5": ["全部", "真人秀", "脱口秀", "喜剧", "晚会", "音乐", "纪录",
+          "游戏", "生活", "文化", "情感", "美食", "竞技"],
+}
+
+FILTERS = {}
+for _tid in ["1", "3", "2", "4", "5"]:
+    FILTERS[_tid] = [
+        {"key": "class", "name": "类型",
+         "value": [{"n": x, "v": "" if x == "全部" else x}
+                   for x in _FILTERS_MAP[_tid]]},
+        {"key": "area", "name": "地区", "value": _AREAS},
+        {"key": "year", "name": "年份", "value": _YEARS},
+    ]
 
 
 # ===================== 正则 =====================
@@ -279,10 +323,28 @@ class Spider(Spider):
 
     def categoryContent(self, tid, pg, filter, extend):
         page = int(pg) if pg else 1
+        if isinstance(extend, str):
+            try:
+                extend = json.loads(extend)
+            except Exception:
+                extend = {}
+        if not extend:
+            extend = {}
+        for k in list(extend.keys()):
+            if extend[k] in ("", None, "全部"):
+                del extend[k]
+
+        # maccms 路径式筛选: /vodtype/{tid}/class/{v}/area/{v}/year/{v}
+        segs = []
+        for key in ("class", "area", "year"):
+            if extend.get(key):
+                segs.append(key)
+                segs.append(urllib.parse.quote(str(extend[key])))
         if page > 1:
-            url = "%s/vodtype/%s/page/%d.html" % (self.site_url, tid, page)
-        else:
-            url = "%s/vodtype/%s.html" % (self.site_url, tid)
+            segs.extend(["page", str(page)])
+        url = "%s/vodtype/%s%s.html" % (
+            self.site_url, tid,
+            ("/" + "/".join(segs)) if segs else "")
         self.log("category: %s" % url)
         html = self._fetch(url)
         self.log("  HTML 长度: %d" % len(html))
@@ -423,9 +485,20 @@ class Spider(Spider):
         if not groups:
             return {"list": []}
 
+        # 线路排序: 直链源(极速/资源类)在前, 需嗅探的外链(哔哩哔哩等)靠后
+        def _line_key(src_idx):
+            name = tabs[src_idx - 1] if src_idx - 1 < len(tabs) else ""
+            if any(w in name for w in ("哔哩", "bilibili", "B站")):
+                return 2
+            if any(w in name for w in ("极速", "量子", "暴风", "非凡",
+                                       "资源", "天空", "无尽", "红牛")):
+                return 0
+            return 1
+
         play_from = []
         play_url = []
-        for src_idx in sorted(groups.keys()):
+        for src_idx in sorted(groups.keys(),
+                              key=lambda x: (_line_key(x), x)):
             eps = groups[src_idx]
             if src_idx - 1 < len(tabs):
                 alias = tabs[src_idx - 1]
@@ -456,7 +529,7 @@ class Spider(Spider):
     # -------- 播放 --------
     def playerContent(self, flag, id, vipFlags):
         play_page = id if id.startswith("http") else self._fix_url(id)
-        self.log("player: %s" % play_page)
+        self.log("player: %s flag=%s" % (play_page, flag))
 
         now = int(time.time())
         if play_page in self._play_cache:
@@ -464,30 +537,33 @@ class Spider(Spider):
             if now - ts < 600:
                 return res
 
+        real_url = ""
         html = self._fetch(play_page, referer=self.site_url + "/")
-        real_url = self._extract_play_url(html) if html else ""
+        if html:
+            real_url = self._extract_play_url(html)
         self.log("  real_url: %s" % (real_url[:200] if real_url else "EMPTY"))
 
         if real_url:
-            if ".m3u8" in real_url.lower() or ".mp4" in real_url.lower():
-                # 直链
+            low = real_url.lower()
+            # 外链嗅探 (哔哩哔哩等非直链)
+            if ".m3u8" not in low and ".mp4" not in low \
+                    and ".flv" not in low and not real_url.endswith(".mp4"):
                 res = {
-                    "parse": 0,
-                    "playUrl": "",
-                    "url": real_url,
-                    "header": {
-                        "User-Agent": UA,
-                        "Referer": self.site_url + "/",
-                    },
+                    "parse": 1, "playUrl": "", "url": real_url,
+                    "header": {"User-Agent": UA},
                 }
                 self._play_cache[play_page] = (now, res)
                 return res
-            # 外链(如哔哩哔哩) -> 交嗅探
+
+            # 直链 m3u8/mp4
             res = {
-                "parse": 1,
+                "parse": 0,
                 "playUrl": "",
                 "url": real_url,
-                "header": {"User-Agent": UA},
+                "header": {
+                    "User-Agent": UA,
+                    "Referer": self.site_url + "/",
+                },
             }
             self._play_cache[play_page] = (now, res)
             return res
