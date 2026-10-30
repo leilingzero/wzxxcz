@@ -172,11 +172,13 @@ _RE_LINE_TAB = re.compile(
     r'<a href="javascript:;" class="line-tab[^"]*"\s*'
     r'data-line="(\d+)"\s*data-target="#epList\d+"\s*title="([^"]*)"', re.I)
 
-# 剧集: ep-chip (title 属性为集名)
-_RE_EPISODE = re.compile(
-    r'<a href="(/index\.php/vod/play/id/\d+/sid/(\d+)/nid/(\d+)\.html)"\s*'
-    r'class="ep-chip[^"]*"\s*'
-    r'data-line="\d+"\s*data-sid="\d+"\s*data-nid="\d+"\s*title="([^"]*)"', re.I)
+# 剧集: 宽松匹配 ep-chip / ep-btn <a> 整块, 再分别提取属性 (兼容属性顺序差异)
+_RE_EPISODE_A = re.compile(
+    r'<a\s+href="(/index\.php/vod/play/id/\d+/sid/(\d+)/nid/(\d+)\.html)"'
+    r'([^>]*)>', re.I)
+_RE_EP_HAS_CLASS = re.compile(r'class="(?:ep-chip|ep-btn)', re.I)
+_RE_EP_SID = re.compile(r'data-sid="(\d+)"', re.I)
+_RE_EP_TITLE = re.compile(r'title="([^"]*)"', re.I)
 
 # 线路别名 (网站 line-tab title 常见值)
 _LINE_ALIAS = {
@@ -551,11 +553,25 @@ class Spider(Spider):
 
         groups = {}
         try:
-            for m in _RE_EPISODE.finditer(html):
-                href = m.group(1).replace("&amp;", "&")
-                sid = m.group(2)
+            for m in _RE_EPISODE_A.finditer(html):
+                attrs = m.group(4)
+                if not _RE_EP_HAS_CLASS.search(attrs):
+                    continue
+                ms = _RE_EP_SID.search(attrs)
+                if not ms:
+                    continue
+                sid = ms.group(1)
                 nid = m.group(3)
-                ep_name = self._clean(m.group(4)) or ("第%s集" % nid)
+                href = m.group(1).replace("&amp;", "&")
+                mt = _RE_EP_TITLE.search(attrs)
+                ep_name = self._clean(mt.group(1)) if mt else ""
+                # ep-btn 无 title, 取标签内文本兜底
+                if not ep_name:
+                    end = html.find("</a>", m.end())
+                    if 0 < end - m.end() < 200:
+                        ep_name = self._clean(html[m.end():end])
+                if not ep_name:
+                    ep_name = "第%s集" % nid
                 groups.setdefault(sid, []).append((int(nid), ep_name, href))
         except Exception as e:
             self.log("  剧集解析失败: %s" % e)
@@ -611,18 +627,25 @@ class Spider(Spider):
         real_url = self._extract_real_url(html) if html else ""
         self.log("  real_url: %s" % (real_url[:200] if real_url else "EMPTY"))
 
-        if real_url and (".m3u8" in real_url.lower() or ".mp4" in real_url.lower()):
+        if real_url and ".mp4" in real_url.lower():
             res = {
-                "parse": 0,
-                "playUrl": "",
-                "url": real_url,
-                "header": {
-                    "User-Agent": UA,
-                    "Referer": self.site_url + "/",
-                },
+                "parse": 0, "playUrl": "", "url": real_url,
+                "header": {"User-Agent": UA, "Referer": self.site_url + "/"},
             }
             self._play_cache[play_page] = (now, res)
-            self.log("  => 直链: %s" % real_url[:160])
+            return res
+
+        if real_url and ".m3u8" in real_url.lower():
+            # 关键: 服务端会 302 跳转 (svip.xgplayN.com -> vipN.jimxtc.com),
+            # master m3u8 内是相对路径子播放列表, 部分播放内核处理不了,
+            # 这里自己完成 302 跟随 + master->子 m3u8 解析, 返回最终直链
+            final_url = self._resolve_real_m3u8(real_url)
+            self.log("  => 最终直链: %s" % final_url[:160])
+            res = {
+                "parse": 0, "playUrl": "", "url": final_url,
+                "header": {"User-Agent": UA, "Referer": self.site_url + "/"},
+            }
+            self._play_cache[play_page] = (now, res)
             return res
 
         # 兜底: 交给 TVBox 嗅探
@@ -630,6 +653,49 @@ class Spider(Spider):
                "header": {"User-Agent": UA, "Referer": self.site_url + "/"}}
         self._play_cache[play_page] = (now, res)
         return res
+
+    def _resolve_real_m3u8(self, url):
+        """跟随 302, 若为 master m3u8 则解析出绝对地址的子 m3u8"""
+        try:
+            rsp = self.fetch(url, headers={
+                "User-Agent": UA,
+                "Accept": "*/*",
+            }, timeout=15)
+        except Exception as e:
+            self.log("  resolve fail: %s" % e)
+            return url
+
+        # requests 跟随 302 后 rsp.url 为最终地址
+        final = url
+        try:
+            if hasattr(rsp, "url") and rsp.url:
+                final = rsp.url
+        except Exception:
+            pass
+
+        text = ""
+        try:
+            text = rsp.text if hasattr(rsp, "text") else ""
+        except Exception:
+            text = ""
+
+        if "#EXTM3U" not in text:
+            self.log("  非 m3u8 内容, 返回原地址")
+            return final
+
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        for i, line in enumerate(lines):
+            if line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
+                sub = lines[i + 1].strip()
+                if sub.startswith("#"):
+                    continue
+                # 相对路径 -> 基于最终地址拼接
+                full = urllib.parse.urljoin(final, sub)
+                self.log("  master 子 m3u8: %s" % full[:160])
+                return full
+
+        self.log("  无子 m3u8, 返回最终地址")
+        return final
 
     def _extract_real_url(self, html):
         """解析 player_aaaa JSON, 取真实 m3u8 地址 (encrypt=0)"""
