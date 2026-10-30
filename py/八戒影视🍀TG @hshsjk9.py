@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 八戒影视 Spider（hipy / CatVod 类爬虫框架适配）V3 — 真机字段校准版
-已用真实接口 (82.156.118.137:88) 逐字段验证:
+已用真实接口 (82.156.118.137:88      http://osstexll.oss-rg-china-mainland.aliyuncs.com/domainPath.json) 逐字段验证:
   - screenType: 树形结构，一级分类(M15电视剧/M16电影/M14短剧/M17动漫/M18综艺/M396动画片)
     children 为筛选组(地区/类型/年份)，叶子 name 即筛选值(如"内地","古装","2025")
   - screenMovie condition: {classify:类型中文名, region:地区中文名,
@@ -19,6 +19,7 @@ import os
 import re
 import json
 import time
+import urllib.parse
 import concurrent.futures
 from urllib.parse import quote
 from typing import Dict, List, Any, Optional, Tuple
@@ -106,6 +107,7 @@ TTL_HOME_VIDEO = 300
 TTL_CATEGORY = 120
 TTL_SEARCH = 60
 TTL_DETAIL = 600
+TTL_PROBE = 1800
 
 PAGE_SIZE = 40
 
@@ -163,12 +165,20 @@ class Spider(_BaseSpider):
         sc = self._quality_score(name)
         return sc, _QUALITY_TAG.get(sc, "")
 
-    def _label_player(self, pl: Dict, used: set) -> str:
+    def _label_player(self, pl: Dict, used: set,
+                      probe: Optional[Dict] = None) -> str:
         base = str(self._sg(pl, "moviePlayerName", "")).strip() or \
             ("线路%s" % pl.get("id", ""))
-        _, tag = self._player_quality(pl)
+        res = (probe or {}).get(pl.get("id"))
+        if res:
+            tag = self._measured_tag(res)
+        else:
+            tag = self._player_quality(pl)[1]
         if tag and tag.lower() not in base.lower():
             base = "%s [%s]" % (base, tag)
+        elif tag and base.lower().startswith("4k") and tag == "标清":
+            # 名字吹4K实测标清 → 加实测标签避免误导
+            base = "%s [实测%s]" % (base, tag)
         name, i = base, 2
         while name in used:
             name = "%s(%d)" % (base, i)
@@ -176,11 +186,221 @@ class Spider(_BaseSpider):
         used.add(name)
         return name
 
-    def _sorted_players(self, player_list: List, current_id) -> List[Dict]:
-        """清晰度高→低；标清以下(不含4K/1080P/720P字样)沉底；当前源优先"""
+    # ---------- 实测分辨率（纯Python，不依赖ffprobe） ----------
+    def _probe_resolution(self, m3u8_url: str) -> Optional[Tuple[int, int]]:
+        """下载首个ts分片，从H.264 SPS解析真实宽高"""
+        try:
+            t = self._http_get_text(m3u8_url)
+            seg = None
+            for line in t.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    seg = urllib.parse.urljoin(m3u8_url, line)
+                    break
+            if not seg:
+                return None
+            # 分片可能本身是 master 嵌套，跟进一层
+            if seg.endswith(".m3u8"):
+                return self._probe_resolution(seg)
+            return self._sps_from_segment(seg)
+        except Exception:
+            return None
+
+    def _http_get_text(self, url: str) -> str:
+        r = self.fetch(url, headers={"User-Agent": UA_PLAY}, timeout=15)
+        if hasattr(r, "text"):
+            return r.text or ""
+        return (r.content or b"").decode("utf-8", "ignore")
+
+    def _sps_from_segment(self, seg_url: str,
+                          max_bytes: int = 1200000) -> Optional[Tuple[int, int]]:
+        try:
+            r = self.fetch(seg_url, headers={"User-Agent": UA_PLAY},
+                           timeout=20, stream=True)
+            stream = getattr(r, "raw", None) or getattr(r, "_sess", None)
+            # 框架fetch一般一次性返回；分片较小，直接全量拿
+            data = r.content if hasattr(r, "content") else b""
+            if not data:
+                return None
+            sps = self._find_sps(data[:max_bytes])
+            if not sps:
+                return None
+            return self._parse_sps(sps)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _find_sps(data: bytes) -> Optional[bytes]:
+        for pat in (b"\x00\x00\x00\x01\x67", b"\x00\x00\x01\x67"):
+            i = data.find(pat)
+            if i >= 0:
+                return data[i + len(pat):i + len(pat) + 64]
+        return None
+
+    @staticmethod
+    def _parse_sps(b: bytes) -> Optional[Tuple[int, int]]:
+        """H.264 SPS → (宽,高)，纯位流解析"""
+        class _BR:
+            __slots__ = ("b", "p")
+            def __init__(s, bb): s.b, s.p = bb, 0
+            def bit(s):
+                v = (s.b[s.p >> 3] >> (7 - (s.p & 7))) & 1
+                s.p += 1
+                return v
+            def bits(s, n):
+                v = 0
+                for _ in range(n):
+                    v = (v << 1) | s.bit()
+                return v
+            def ue(s):
+                z = 0
+                while not s.bit():
+                    z += 1
+                    if z > 32:
+                        raise ValueError
+                return ((1 << z) - 1 + s.bits(z)) if z else 0
+            def se(s):
+                v = s.ue()
+                return ((-1) ** (v + 1)) * ((v + 1) >> 1) if v else 0
+
+        try:
+            r = _BR(b)
+            r.bits(8)
+            profile = r.bits(8)
+            r.bits(8)
+            r.bits(8)
+            r.ue()
+            chroma = 1
+            if profile in (100, 110, 122, 244, 44, 83, 86, 118, 128,
+                           138, 139, 134, 135):
+                chroma = r.ue()
+                if chroma == 3:
+                    r.bit()
+                r.ue()
+                r.ue()
+                if r.bit():          # scaling_matrix 跳过
+                    cnt = 8 if chroma != 3 else 12
+                    for i in range(cnt):
+                        if r.bit():
+                            size = 16 if i < 6 else 64
+                            last, nxt = 8, 8
+                            for _ in range(size):
+                                if nxt:
+                                    d = r.se()
+                                    nxt = (last + d + 256) % 256
+                                last = 0 if (nxt != 0 and nxt != 0) and False else (nxt or last)
+                                if not nxt:
+                                    break
+            r.ue()
+            poc = r.ue()
+            if poc == 0:
+                r.ue()
+            elif poc == 1:
+                r.bit()
+                r.ue()
+                r.ue()
+            r.ue()
+            r.bit()
+            w = (r.ue() + 1) * 16
+            h = (r.ue() + 1) * 16
+            if not r.bit():
+                r.bit()
+            r.bit()
+            if r.bit():              # crop
+                cl = r.ue(); cr = r.ue(); ct = r.ue(); cb = r.ue()
+                if chroma == 0:
+                    cu = cv = 2
+                elif chroma == 3:
+                    cu = cv = 1
+                else:
+                    cu, cv = 2, 2
+                w -= (cl + cr) * cu
+                h -= (ct + cb) * cv
+            if 16 <= w <= 8192 and 16 <= h <= 8192:
+                return int(w), int(h)
+            return None
+        except Exception:
+            return None
+
+    def _probe_lines(self, video_id: str, player_list: List,
+                     episode_list: List) -> Dict[Any, Tuple[int, int]]:
+        """并发探测各线路真实分辨率，结果缓存30分钟"""
+        cache_key = "probe_%s" % video_id
+        cached = self._get_cache(cache_key, TTL_PROBE)
+        if cached is not None:
+            return cached
+
+        ep0 = (episode_list[0].get("id") if episode_list else "") or ""
+
+        def _probe_one(pl):
+            try:
+                pl_id = pl.get("id")
+                if ep0:
+                    payload = {"episodeId": str(ep0), "id": video_id,
+                               "playerId": str(pl_id), "source": 0,
+                               "typeId": "M17", "userId": self.userid}
+                else:
+                    payload = {"episodeIndex": "0", "id": self._to_int(video_id, 0),
+                               "playerId": str(pl_id), "source": 0,
+                               "typeId": "M16", "userId": self.userid}
+                result = self._api("/api/v1/app/play/movieDetails",
+                                   payload=payload)
+                if not result:
+                    return pl_id, None
+                data = result.get("data", {}) or {}
+                parse_url = self._sg(data, "url")
+                if not parse_url:
+                    return pl_id, None
+                analysis = self._api(
+                    "/api/v1/app/play/analysisMovieUrl?playerUrl=%s&playerId=%s"
+                    % (quote(str(parse_url), safe=""), pl_id), method="GET")
+                url = (analysis.get("data", "") if analysis else "") or ""
+                if isinstance(url, dict):
+                    url = url.get("url", "") or ""
+                if not str(url).startswith("http"):
+                    return pl_id, None
+                return pl_id, self._probe_resolution(str(url))
+            except Exception:
+                return pl.get("id"), None
+
+        out: Dict[Any, Tuple[int, int]] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            for pl_id, res in ex.map(_probe_one, player_list or []):
+                out[pl_id] = res
+        self._log("probe: %s" % {k: v for k, v in out.items()})
+        self._set_cache(cache_key, out)
+        return out
+
+    @staticmethod
+    def _measured_tag(res) -> str:
+        """实测分辨率 → 标签"""
+        if not res:
+            return ""
+        w = res[0]
+        if w >= 3600:
+            return "4K"
+        if w >= 1900:
+            return "1080P"
+        if w >= 1200:
+            return "720P"
+        return "标清"
+
+    def _sorted_players(self, player_list: List, current_id,
+                        probe: Optional[Dict] = None) -> List[Dict]:
+        """
+        排序：实测分辨率 高→低（探测失败沉到已探测线路之后）；
+        无实测时按名称清晰度分；当前源在同等条件下优先。
+        """
         def _key(pl):
-            score, _ = self._player_quality(pl)
             is_cur = 1 if pl.get("id") == current_id else 0
+            if probe:
+                res = probe.get(pl.get("id"))
+                measured = 1 if res else 0
+                w = res[0] if res else 0
+                # 有实测的排前（按宽度降序），没实测的按名称分排后
+                return (0 if measured else 1, -w,
+                        -self._player_quality(pl)[0], -is_cur)
+            score, _ = self._player_quality(pl)
             low = 0 if score >= 60 else 1
             return (low, -score, -is_cur)
         return sorted(player_list or [], key=_key)
@@ -532,12 +752,15 @@ class Spider(_BaseSpider):
         episode_list = data.get("episodeList", []) or []
         player_list = data.get("moviePlayerList", []) or []
 
+        # 实测各线路真实分辨率（并发+缓存，失败自动回退名称识别）
+        probe = self._probe_lines(video_id, player_list, episode_list)
+
         if self._is_short_drama(data, player_list):
             play_urls, show = self._build_short_drama_playlist(
-                video_id, player_list, current_id)
+                video_id, player_list, current_id, probe)
         else:
             play_urls, show = self._build_normal_playlist(
-                video_id, episode_list, player_list, current_id)
+                video_id, episode_list, player_list, current_id, probe)
 
         if not play_urls:
             show = ["默认源"]
@@ -552,13 +775,20 @@ class Spider(_BaseSpider):
 
         content = (INTRO_PREFIX + "\n" + intro) if intro else INTRO_PREFIX
 
-        # 备注: 最高清晰度标签 + 线路数（从真实 playerList 判断，不受改名影响）
+        # 备注: 实测最高分辨率 + 线路数（探测失败才用名称识别）
         best_tag = ""
-        best_score = 0
+        best_w = 0
         for pl in player_list or []:
-            sc, tg = self._player_quality(pl)
-            if sc > best_score:
-                best_score, best_tag = sc, tg
+            res = probe.get(pl.get("id"))
+            if res and res[0] > best_w:
+                best_w = res[0]
+                best_tag = self._measured_tag(res)
+        if not best_tag:
+            for pl in player_list or []:
+                _, tg = self._player_quality(pl)
+                if tg:
+                    best_tag = tg
+                    break
         remarks = ("%s · %d条线路" % (best_tag, len(show))
                    if best_tag else "%d条线路" % len(show))
 
@@ -598,10 +828,10 @@ class Spider(_BaseSpider):
                 return True
         return False
 
-    def _build_short_drama_playlist(self, video_id, player_list,
-                                    current_id) -> Tuple[List[str], List[str]]:
+    def _build_short_drama_playlist(self, video_id, player_list, current_id,
+                                    probe=None) -> Tuple[List[str], List[str]]:
         play_urls, show, used = [], [], set()
-        for pl in self._sorted_players(player_list, current_id):
+        for pl in self._sorted_players(player_list, current_id, probe):
             ep_total = self._to_int(self._sg(pl, "episodeTotal", 0))
             if ep_total <= 0:
                 continue
@@ -609,11 +839,11 @@ class Spider(_BaseSpider):
                   for ep in range(1, min(ep_total + 1, SHORT_EP_MAX))]
             if pu:
                 play_urls.append("#".join(pu))
-                show.append(self._label_player(pl, used))
+                show.append(self._label_player(pl, used, probe))
         return play_urls, show
 
     def _build_normal_playlist(self, video_id, episode_list, player_list,
-                               current_id) -> Tuple[List[str], List[str]]:
+                               current_id, probe=None) -> Tuple[List[str], List[str]]:
         """真机 episodeList: [{id, episode:'第1集', lock}]"""
         play_urls, show, used = [], [], set()
         done_ids = set()
@@ -621,7 +851,7 @@ class Spider(_BaseSpider):
         if episode_list:
             # 真实分集：清晰度排序后，逐源尝试匹配 episodeTotal；
             # 第一源用真实分集，其余源虚拟分集
-            for pl in self._sorted_players(player_list, current_id):
+            for pl in self._sorted_players(player_list, current_id, probe):
                 pl_id = pl.get("id")
                 if pl_id in done_ids:
                     continue
@@ -643,9 +873,9 @@ class Spider(_BaseSpider):
                     done_ids.add(pl_id)
                 if pu:
                     play_urls.append("#".join(pu))
-                    show.append(self._label_player(pl, used))
+                    show.append(self._label_player(pl, used, probe))
         else:
-            for pl in self._sorted_players(player_list, current_id):
+            for pl in self._sorted_players(player_list, current_id, probe):
                 ep_total = self._to_int(self._sg(pl, "episodeTotal", 0))
                 if ep_total <= 0:
                     continue
@@ -654,7 +884,7 @@ class Spider(_BaseSpider):
                       for ep in range(1, min(ep_total + 1, NORMAL_EP_MAX))]
                 if pu:
                     play_urls.append("#".join(pu))
-                    show.append(self._label_player(pl, used))
+                    show.append(self._label_player(pl, used, probe))
 
         return play_urls, show
 
