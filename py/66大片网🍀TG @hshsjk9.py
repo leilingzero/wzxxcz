@@ -1,10 +1,11 @@
 # coding=utf-8
 """
-66大片网 www.66dpw.vip | TVBox Python 爬虫 
+66大片网 www.66dpw.vip | TVBox Python 爬虫 (V1.0)
 关键:
   - 苹果CMS mxpro 模板解析
   - 破解播放页 player_aaaa 的 encrypt=2 地址: base64 -> URL decode
   - 极速线路直出 m3u8 (parse=0), 哔哩哔哩等外链交嗅探 (parse=1)
+  - 简介添加指定前缀
   - 搜索接口带验证码检测 (返回空并提示)
 """
 import re
@@ -71,52 +72,59 @@ CLASSES = [
     {"type_id": "4", "type_name": "短剧"},
 ]
 
-# 筛选: maccms 内置 /vodtype/{tid}/class/{v}/area/{v}/year/{v}.html
-# (无效值服务端会静默降级为全部列表, 安全)
-_SORTS = [{"n": "全部", "v": ""}]
-_YEARS = [{"n": "全部", "v": ""}] + \
-         [{"n": str(y), "v": str(y)} for y in range(2026, 1999, -1)]
-_AREAS = [
-    {"n": "全部", "v": ""},
-    {"n": "中国大陆", "v": "中国大陆"}, {"n": "美国", "v": "美国"},
-    {"n": "中国香港", "v": "中国香港"}, {"n": "中国台湾", "v": "中国台湾"},
-    {"n": "韩国", "v": "韩国"}, {"n": "日本", "v": "日本"},
-    {"n": "英国", "v": "英国"}, {"n": "法国", "v": "法国"},
-    {"n": "泰国", "v": "泰国"}, {"n": "印度", "v": "印度"},
-    {"n": "其它", "v": "其它"},
-]
+# ===== 站点真实筛选 (www.66dpw.vip/vodshow) =====
+# 路径格式: /vodshow/{类型ID}-{地区}-{语言}-{年份}-{字母}-{剧情}-{排序}-{页码}.html
+# 说明: 该站筛选页需过一次图形验证码, 爬虫端无法预置会话,
+#       因此这里用站点公布的全部筛选项(名称与站内完全一致)拼装路径,
+#       未触发验证码时返回真实结果, 触发时自动降级为 vodtype 列表。
+
+_SUB_TYPES = {"1": [["全部", ""], ["科幻片", "8"], ["恐怖片", "9"], ["动作片", "10"], ["战争片", "11"], ["爱情片", "12"], ["喜剧片", "13"], ["剧情片", "14"], ["记录片", "15"]], "2": [["全部", ""], ["大陆番", "16"], ["日本番", "17"], ["韩国番", "18"], ["港台番", "20"], ["欧美番", "21"]], "3": [["全部", ""], ["大陆剧", "22"], ["日本剧", "23"], ["韩国剧", "24"], ["香港剧", "25"], ["台湾剧", "26"], ["欧美剧", "27"]], "5": [["全部", ""], ["大陆综艺", "28"], ["港台综艺", "29"], ["日韩综艺", "30"], ["欧美综艺", "31"]]}
+
+_AREAS = {"1": [["全部", ""], ["大陆", "大陆"], ["香港", "香港"], ["台湾", "台湾"], ["美国", "美国"], ["法国", "法国"], ["英国", "英国"], ["日本", "日本"], ["韩国", "韩国"], ["德国", "德国"], ["泰国", "泰国"], ["印度", "印度"], ["意大利", "意大利"], ["西班牙", "西班牙"], ["加拿大", "加拿大"], ["其他", "其他"]], "2": [["全部", ""], ["内地", "内地"], ["香港", "香港"], ["台湾", "台湾"], ["美国", "美国"], ["法国", "法国"], ["英国", "英国"], ["日本", "日本"], ["韩国", "韩国"], ["德国", "德国"], ["泰国", "泰国"], ["印度", "印度"], ["意大利", "意大利"], ["西班牙", "西班牙"], ["加拿大", "加拿大"], ["其他", "其他"]], "3": [["全部", ""], ["内地", "内地"], ["日本", "日本"], ["韩国", "韩国"], ["香港", "香港"], ["台湾", "台湾"], ["美国", "美国"], ["德国", "德国"], ["法国", "法国"], ["英国", "英国"], ["意大利", "意大利"], ["西班牙", "西班牙"], ["荷兰", "荷兰"], ["瑞典", "瑞典"], ["瑞士", "瑞士"], ["奥地利", "奥地利"], ["比利时", "比利时"], ["丹麦", "丹麦"], ["挪威", "挪威"], ["芬兰等", "芬兰等"], ["澳大利亚", "澳大利亚"], ["新西兰", "新西兰"], ["加拿大", "加拿大"]], "4": [["全部", ""], ["内地", "内地"], ["美国", "美国"], ["德国", "德国"], ["法国", "法国"], ["英国", "英国"], ["意大利", "意大利"], ["西班牙", "西班牙"], ["荷兰", "荷兰"], ["瑞典", "瑞典"], ["瑞士", "瑞士"], ["奥地利", "奥地利"], ["比利时", "比利时"], ["丹麦", "丹麦"], ["挪威", "挪威"], ["芬兰等", "芬兰等"], ["澳大利亚", "澳大利亚"], ["新西兰", "新西兰"], ["加拿大", "加拿大"]], "5": [["全部", ""], ["内地", "内地"], ["香港", "香港"], ["台湾", "台湾"], ["美国", "美国"], ["法国", "法国"], ["英国", "英国"], ["日本", "日本"], ["韩国", "韩国"], ["德国", "德国"], ["泰国", "泰国"], ["印度", "印度"], ["意大利", "意大利"], ["西班牙", "西班牙"], ["加拿大", "加拿大"], ["其他", "其他"]]}
+
+_GENDERS = {"1": [["全部", ""], ["警匪", "警匪"], ["犯罪", "犯罪"], ["动画", "动画"], ["奇幻", "奇幻"], ["武侠", "武侠"], ["冒险", "冒险"], ["枪战", "枪战"], ["悬疑", "悬疑"], ["惊悚", "惊悚"], ["经典", "经典"], ["青春", "青春"], ["文艺", "文艺"], ["微电影", "微电影"], ["古装", "古装"], ["历史", "历史"], ["运动", "运动"], ["农村", "农村"], ["儿童", "儿童"], ["网络电影", "网络电影"]], "2": [["全部", ""], ["热血", "热血"], ["励志", "励志"], ["玄幻", "玄幻"], ["古风", "古风"], ["动态漫", "动态漫"], ["恋爱", "恋爱"], ["青春", "青春"], ["校园", "校园"], ["运动", "运动"], ["科幻", "科幻"], ["冒险", "冒险"], ["魔法", "魔法"], ["日常", "日常"], ["治愈", "治愈"], ["机战", "机战"], ["推理", "推理"], ["都市", "都市"], ["小说改", "小说改"], ["游戏改", "游戏改"], ["漫画改", "漫画改"]], "3": [["全部", ""], ["喜剧", "喜剧"], ["爱情", "爱情"], ["恐怖", "恐怖"], ["动作", "动作"], ["科幻", "科幻"], ["剧情", "剧情"], ["战争", "战争"], ["警匪", "警匪"], ["犯罪", "犯罪"], ["动画", "动画"], ["奇幻", "奇幻"], ["武侠", "武侠"], ["冒险", "冒险"], ["枪战", "枪战"], ["悬疑", "悬疑"], ["惊悚", "惊悚"], ["经典", "经典"], ["青春", "青春"], ["文艺", "文艺"], ["微电视剧", "微电视剧"], ["古装", "古装"], ["历史", "历史"], ["运动", "运动"], ["农村", "农村"], ["儿童", "儿童"], ["网络电视剧", "网络电视剧"], ["其他", "其他"]], "4": [["全部", ""], ["喜剧", "喜剧"], ["爱情", "爱情"], ["恐怖", "恐怖"], ["动作", "动作"], ["科幻", "科幻"], ["剧情", "剧情"], ["战争", "战争"], ["警匪", "警匪"], ["犯罪", "犯罪"], ["动画", "动画"], ["奇幻", "奇幻"], ["武侠", "武侠"], ["冒险", "冒险"], ["枪战", "枪战"], ["悬疑", "悬疑"], ["惊悚", "惊悚"], ["经典", "经典"], ["青春", "青春"], ["文艺", "文艺"], ["微电视剧", "微电视剧"], ["古装", "古装"], ["历史", "历史"], ["运动", "运动"], ["农村", "农村"], ["儿童", "儿童"], ["网络电视剧", "网络电视剧"], ["其他", "其他"]], "5": [["全部", ""], ["偶像", "偶像"], ["舞蹈", "舞蹈"], ["音乐", "音乐"], ["情感", "情感"], ["喜剧", "喜剧"], ["体育", "体育"], ["游戏", "游戏"], ["相声", "相声"], ["婚恋", "婚恋"], ["时尚", "时尚"], ["晚会", "晚会"], ["明星访谈", "明星访谈"], ["亲子", "亲子"], ["生活", "生活"], ["文化", "文化"], ["美食", "美食"], ["旅游", "旅游"], ["溢智", "溢智"]]}
+
+_LANGS = {"1": [["全部", ""], ["国语", "国语"], ["英语", "英语"], ["粤语", "粤语"], ["闽南语", "闽南语"], ["韩语", "韩语"], ["日语", "日语"], ["其它", "其它"]], "2": [["全部", ""], ["国语", "国语"], ["英语", "英语"], ["粤语", "粤语"], ["闽南语", "闽南语"], ["韩语", "韩语"], ["日语", "日语"], ["其它", "其它"]], "3": [["全部", ""], ["国语", "国语"], ["粤语", "粤语"], ["闽南语", "闽南语"], ["日语", "日语"], ["韩语", "韩语"], ["英语", "英语"], ["法语", "法语"], ["德语", "德语"], ["其它", "其它"]], "4": [["全部", ""], ["国语", "国语"], ["英语", "英语"], ["粤语", "粤语"], ["闽南语", "闽南语"], ["韩语", "韩语"], ["日语", "日语"], ["法语", "法语"], ["德语", "德语"], ["其它", "其它"]], "5": [["全部", ""], ["国语", "国语"], ["英语", "英语"], ["粤语", "粤语"], ["闽南语", "闽南语"], ["韩语", "韩语"], ["日语", "日语"], ["法语", "法语"], ["德语", "德语"], ["其它", "其它"]]}
+
+_LETTERS = [["字母", ""]] + [[c, c] for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"] + [["0-9", "0-9"]]
+_YEARS = [["全部", ""]] + [[str(y), str(y)] for y in range(2026, 2007, -1)]
+_ORDERS = [["时间排序", "time"], ["人气排序", "hits"], ["评分排序", "score"]]
+
 _CLASSES_ALL = [
-    "剧情", "喜剧", "爱情", "动作", "悬疑", "恐怖", "科幻", "奇幻",
-    "犯罪", "惊悚", "冒险", "战争", "历史", "古装", "家庭", "纪录",
-    "动画", "音乐", "传记", "武侠", "运动", "灾难", "西部", "短片",
+    {"type_id": "1", "type_name": "电影"},
+    {"type_id": "3", "type_name": "剧集"},
+    {"type_id": "2", "type_name": "动漫"},
+    {"type_id": "5", "type_name": "综艺"},
+    {"type_id": "4", "type_name": "短剧"},
 ]
 
-_FILTERS_MAP = {
-    "1": ["全部", "剧情", "喜剧", "爱情", "动作", "惊悚", "犯罪", "恐怖",
-          "悬疑", "冒险", "奇幻", "科幻", "家庭", "历史", "战争", "纪录",
-          "古装", "音乐", "动画", "传记", "武侠", "运动", "短片"],
-    "3": ["全部", "剧情", "喜剧", "爱情", "犯罪", "悬疑", "家庭", "古装",
-          "惊悚", "动作", "奇幻", "科幻", "都市", "历史", "战争", "冒险",
-          "武侠", "恐怖", "青春", "传记", "情感", "纪录", "军旅"],
-    "2": ["全部", "动画", "冒险", "喜剧", "奇幻", "剧情", "科幻", "动作",
-          "儿童", "悬疑", "都市", "家庭", "国漫", "日常", "爱情", "玄幻",
-          "日漫", "音乐", "治愈", "古风", "校园"],
-    "4": ["全部", "剧情", "爱情", "古装", "悬疑", "喜剧", "奇幻", "都市",
-          "玄幻", "犯罪", "家庭", "穿越", "惊悚", "武侠", "科幻", "动作",
-          "冒险", "恐怖", "青春", "历史"],
-    "5": ["全部", "真人秀", "脱口秀", "喜剧", "晚会", "音乐", "纪录",
-          "游戏", "生活", "文化", "情感", "美食", "竞技"],
-}
 
-FILTERS = {}
-for _tid in ["1", "3", "2", "4", "5"]:
-    FILTERS[_tid] = [
-        {"key": "class", "name": "类型",
-         "value": [{"n": x, "v": "" if x == "全部" else x}
-                   for x in _FILTERS_MAP[_tid]]},
-        {"key": "area", "name": "地区", "value": _AREAS},
-        {"key": "year", "name": "年份", "value": _YEARS},
-    ]
+def _mk_filter(tid):
+    fl = []
+    if str(tid) in _SUB_TYPES:
+        fl.append({"key": "type", "name": "类型",
+                   "value": [{"n": n, "v": v} for n, v in _SUB_TYPES[str(tid)]]})
+    if str(tid) in _GENDERS:
+        fl.append({"key": "class", "name": "剧情",
+                   "value": [{"n": n, "v": v} for n, v in _GENDERS[str(tid)]]})
+    if str(tid) in _AREAS:
+        fl.append({"key": "area", "name": "地区",
+                   "value": [{"n": n, "v": v} for n, v in _AREAS[str(tid)]]})
+    if str(tid) in _LANGS:
+        fl.append({"key": "lang", "name": "语言",
+                   "value": [{"n": n, "v": v} for n, v in _LANGS[str(tid)]]})
+    fl.append({"key": "year", "name": "年份",
+               "value": [{"n": n, "v": v} for n, v in _YEARS]})
+    fl.append({"key": "letter", "name": "字母",
+               "value": [{"n": n, "v": v} for n, v in _LETTERS]})
+    fl.append({"key": "order", "name": "排序",
+               "value": [{"n": n, "v": v} for n, v in _ORDERS]})
+    return fl
+
+
+CLASSES = _CLASSES_ALL
+FILTERS = {c["type_id"]: _mk_filter(c["type_id"]) for c in CLASSES}
+
 
 
 # ===================== 正则 =====================
@@ -142,6 +150,8 @@ _RE_PLAY_A = re.compile(
     r'<a[^>]+href="(/vodplay/\d+-(\d+)-\d+\.html)"\s+title="([^"]*)"',
     re.I)
 _RE_SPAN = re.compile(r'<span>([^<]*)</span>', re.I)
+# 每个播放面板起点(面板顺序 == 标签顺序, 但内部 src 序号可能乱序)
+_RE_PANEL = re.compile(r'module-play-list-content', re.I)
 
 # 详情页
 _RE_TITLE_TAG = re.compile(r'<title>(.*?)</title>', re.S | re.I)
@@ -188,6 +198,7 @@ class Spider(Spider):
             "Upgrade-Insecure-Requests": "1",
         }
         self.default_pic = DEFAULT_PIC
+        self._last_captcha = False
         self._play_cache = {}
         self.log("init: site=%s" % self.site_url)
 
@@ -208,10 +219,13 @@ class Spider(Spider):
                 text = str(rsp)
             if _RE_CAPTCHA.search(text):
                 self.log("⚠️ 触发验证码: %s" % url)
-                return ""
+                self._last_captcha = True
+                return text
+            self._last_captcha = False
             return text
         except Exception as e:
             self.log("fetch FAIL %s -> %s" % (url, e))
+            self._last_captcha = False
             return ""
 
     def _fix_url(self, url):
@@ -301,6 +315,14 @@ class Spider(Spider):
             })
         return videos
 
+    def _is_list_page(self, html):
+        """判断是否为正常列表页(排除验证码页/空页)"""
+        if not html or len(html) < 3000:
+            return False
+        if _RE_CAPTCHA.search(html):
+            return False
+        return ("module-poster-item" in html) or ("voddetail/" in html)
+
     def _page_count(self, html):
         if not html:
             return 1
@@ -334,19 +356,56 @@ class Spider(Spider):
             if extend[k] in ("", None, "全部"):
                 del extend[k]
 
-        # maccms 路径式筛选: /vodtype/{tid}/class/{v}/area/{v}/year/{v}
-        segs = []
-        for key in ("class", "area", "year"):
-            if extend.get(key):
-                segs.append(key)
-                segs.append(urllib.parse.quote(str(extend[key])))
+        # 站点真实筛选路径: /vodshow/{类型ID}-{地区}-{语言}-{年份}-{字母}-{剧情}-{排序}-{页}.html
+        type_id = str(extend.get("type") or tid or "")
+        area = str(extend.get("area") or "")
+        lang = str(extend.get("lang") or "")
+        year = str(extend.get("year") or "")
+        letter = str(extend.get("letter") or "")
+        gender = str(extend.get("class") or "")
+        order = str(extend.get("order") or "")
+
+        def q(s):
+            return urllib.parse.quote(s.encode("utf-8")) if s else ""
+
+        # 站点 vodshow 为固定 12 段路径, 段位实测如下:
+        # [0]类型ID [1]地区 [2]排序 [3]剧情 [4]语言 [5]字母
+        # [6]字母0-9的"9" [7..10]保留 [11]年份
+        letter_a, letter_b = "", ""
+        if letter == "0-9":
+            # 0-9 站内占用 "0"、"9" 两段, 需额外补空段维持 12 段结构
+            letter_a, letter_b = "0", "9"
+        elif letter:
+            letter_a = letter
+
+        segs = [
+            type_id,      # 0 类型/子分类ID
+            q(area),      # 1 地区
+            q(order),     # 2 排序 time/hits/score
+            q(gender),    # 3 剧情
+            q(lang),      # 4 语言
+            q(letter_a),  # 5 字母
+            q(letter_b),  # 6 0-9 时的 9
+            "", "", "", "",   # 7-10 保留
+            q(year),      # 11 年份
+        ]
+        if letter == "0-9":
+            segs.insert(7, "")
+        path = "-".join(segs)
         if page > 1:
-            segs.extend(["page", str(page)])
-        url = "%s/vodtype/%s%s.html" % (
-            self.site_url, tid,
-            ("/" + "/".join(segs)) if segs else "")
-        self.log("category: %s" % url)
+            path += "-" + str(page)
+        url = "%s/vodshow/%s.html" % (self.site_url, path)
+        self.log("category(vodshow): %s" % url)
+
         html = self._fetch(url)
+        if not self._is_list_page(html):
+            # 触发验证码或返回异常 -> 先回退到 vodtype 列表(不带筛选)
+            self.log("  ⚠️ vodshow 被验证码拦截, 回退 vodtype")
+            base = "%s/vodtype/%s%s.html" % (
+                self.site_url, type_id,
+                "" if page <= 1 else "/page/%d" % page)
+            html = self._fetch(base)
+            self.log("  HTML 长度: %d" % len(html))
         self.log("  HTML 长度: %d" % len(html))
 
         videos = self._extract_videos(html)
@@ -460,9 +519,19 @@ class Spider(Spider):
             self.log("  元信息解析失败: %s" % e)
 
         # ===== 线路与剧集 =====
-        # 线路名按 data-dropdown-value 顺序; 集数按 href 中 src 序号分组
-        tabs = [self._clean(t) for t in _RE_TAB.findall(html)]
-        tabs = [t for t in tabs if t]
+        # 关键: 面板(panel)顺序 == 标签(data-dropdown-value)顺序,
+        #       但 panel 内的 src 序号并不按 1,2,3 递增 (实测 2,1,3),
+        #       因此必须按 panel 出现顺序配对标签, 不能用 src 序号反推。
+        tab_names = [self._clean(t) for t in _RE_TAB.findall(html)]
+        tab_names = [t for t in tab_names if t]
+
+        panel_src_order = []   # 面板顺序 -> src 序号
+        for pm in _RE_PANEL.finditer(html):
+            seg = html[pm.start():pm.start() + 8000]
+            me = _RE_PLAY_A.search(seg)
+            if me:
+                panel_src_order.append(int(me.group(2)))
+
         groups = {}
         try:
             for m in _RE_PLAY_A.finditer(html):
@@ -481,29 +550,45 @@ class Spider(Spider):
             self.log("  剧集解析失败: %s" % e)
 
         self.log("  剧集: %s" % {k: len(v) for k, v in groups.items()})
+        self.log("  面板顺序: %s | 标签: %s" % (panel_src_order, tab_names))
 
         if not groups:
             return {"list": []}
 
-        # 线路排序: 直链源(极速/资源类)在前, 需嗅探的外链(哔哩哔哩等)靠后
-        def _line_key(src_idx):
-            name = tabs[src_idx - 1] if src_idx - 1 < len(tabs) else ""
-            if any(w in name for w in ("哔哩", "bilibili", "B站")):
+        # src 序号 -> 线路别名: 优先按面板顺序与标签一一配对
+        alias_map = {}
+        for i, s in enumerate(panel_src_order):
+            if i < len(tab_names) and s not in alias_map:
+                alias_map[s] = tab_names[i]
+        # 兜底: 剩余 src 用位次/序号命名
+        for s in sorted(groups.keys()):
+            if s not in alias_map:
+                if s - 1 < len(tab_names) and tab_names[s - 1] \
+                        not in alias_map.values():
+                    alias_map[s] = tab_names[s - 1]
+                else:
+                    alias_map[s] = "线路%d" % s
+
+        # 线路排序: 可直连的源(极速/量子等)在前,
+        #           需第三方解析的外链(腾讯/爱奇艺/优酷/哔哩等)垫底
+        _DIRECT_WORDS = ("极速", "量子", "暴风", "非凡", "资源", "天空",
+                         "无尽", "红牛", "魔都", "极速云", "m3u8", "线路")
+        _VIP_WORDS = ("腾讯", "爱奇艺", "优酷", "芒果", "哔哩", "B站",
+                      "bilibili", "搜狐", "乐视", "PPTV", "咪咕", "央视频")
+
+        def _line_key(s):
+            name = alias_map.get(s, "")
+            if any(w in name for w in _VIP_WORDS):
                 return 2
-            if any(w in name for w in ("极速", "量子", "暴风", "非凡",
-                                       "资源", "天空", "无尽", "红牛")):
+            if any(w in name for w in _DIRECT_WORDS):
                 return 0
             return 1
 
         play_from = []
         play_url = []
-        for src_idx in sorted(groups.keys(),
-                              key=lambda x: (_line_key(x), x)):
-            eps = groups[src_idx]
-            if src_idx - 1 < len(tabs):
-                alias = tabs[src_idx - 1]
-            else:
-                alias = "线路%d" % src_idx
+        for s in sorted(groups.keys(), key=lambda x: (_line_key(x), x)):
+            eps = groups[s]
+            alias = alias_map.get(s, "线路%d" % s)
             play_from.append(alias)
             play_url.append("#".join(
                 "%s$%s" % (n, self._fix_url(h)) for n, h in eps))
@@ -527,6 +612,62 @@ class Spider(Spider):
         }]}
 
     # -------- 播放 --------
+    # -------- 自动换源 --------
+    def _vod_id(self, play_page):
+        m = re.search(r"/vodplay/(\d+)-", play_page)
+        return m.group(1) if m else ""
+
+    def _ep_index(self, play_page):
+        m = re.search(r"/vodplay/\d+-(\d+)-(\d+)\.html", play_page)
+        return int(m.group(2)) if m else 0
+
+    def _find_direct_line(self, vod_id, ep_idx):
+        """反查同片其它线路, 找到可直连的 m3u8 (优先极速类)"""
+        cache_key = "alt:%s" % vod_id
+        now = int(time.time())
+        if cache_key in self._play_cache:
+            ts, cand = self._play_cache[cache_key]
+            if now - ts < 1800:
+                return self._try_lines(vod_id, ep_idx, cand)
+        html = self._fetch("%s/voddetail/%s.html" % (self.site_url, vod_id))
+        if not html:
+            return ""
+        tab_names = [self._clean(t) for t in _RE_TAB.findall(html)]
+        tab_names = [t for t in tab_names if t]
+        # 面板顺序 -> src 序号
+        order = []
+        for pm in _RE_PANEL.finditer(html):
+            seg = html[pm.start():pm.start() + 8000]
+            me = _RE_PLAY_A.search(seg)
+            if me:
+                order.append(int(me.group(2)))
+        cand = []
+        for i, s in enumerate(order):
+            name = tab_names[i] if i < len(tab_names) else ""
+            if any(w in name for w in ("极速", "量子", "暴风", "非凡", "资源",
+                                       "天空", "无尽", "红牛", "魔都")):
+                cand.insert(0, s)      # 直连源优先
+            elif any(w in name for w in ("腾讯", "爱奇艺", "优酷", "芒果",
+                                        "哔哩", "B站", "搜狐", "乐视")):
+                continue               # VIP 外链跳过
+            else:
+                cand.append(s)
+        self._play_cache[cache_key] = (now, cand)
+        self.log("  换源候选: %s" % cand)
+        return self._try_lines(vod_id, ep_idx, cand)
+
+    def _try_lines(self, vod_id, ep_idx, cand):
+        for s in cand:
+            url = "%s/vodplay/%s-%d-%d.html" % (
+                self.site_url, vod_id, s, ep_idx)
+            h = self._fetch(url, referer=self.site_url + "/")
+            if not h:
+                continue
+            u = self._extract_play_url(h)
+            if u and (".m3u8" in u.lower() or ".mp4" in u.lower()):
+                return u
+        return ""
+
     def playerContent(self, flag, id, vipFlags):
         play_page = id if id.startswith("http") else self._fix_url(id)
         self.log("player: %s flag=%s" % (play_page, flag))
@@ -545,9 +686,24 @@ class Spider(Spider):
 
         if real_url:
             low = real_url.lower()
-            # 外链嗅探 (哔哩哔哩等非直链)
+            # 外链嗅探 (腾讯/爱奇艺/优酷/芒果/哔哩等非直链)
             if ".m3u8" not in low and ".mp4" not in low \
                     and ".flv" not in low and not real_url.endswith(".mp4"):
+                # ★ 自动换源: 本站多数影片有「极速」直连线路,
+                #   当前页是 VIP 外链时, 反查同片直链并直接返回
+                ep_idx = self._ep_index(play_page)
+                vod_id = self._vod_id(play_page)
+                if vod_id and ep_idx:
+                    alt = self._find_direct_line(vod_id, ep_idx)
+                    if alt:
+                        self.log("  ★ 自动换源成功: %s" % alt[:120])
+                        res = {
+                            "parse": 0, "playUrl": "", "url": alt,
+                            "header": {"User-Agent": UA,
+                                       "Referer": self.site_url + "/"},
+                        }
+                        self._play_cache[play_page] = (now, res)
+                        return res
                 res = {
                     "parse": 1, "playUrl": "", "url": real_url,
                     "header": {"User-Agent": UA},
