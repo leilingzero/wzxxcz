@@ -218,11 +218,12 @@ class Spider(_BaseSpider):
     def _sps_from_segment(self, seg_url: str,
                           max_bytes: int = 1200000) -> Optional[Tuple[int, int]]:
         try:
-            r = self.fetch(seg_url, headers={"User-Agent": UA_PLAY},
-                           timeout=20, stream=True)
-            stream = getattr(r, "raw", None) or getattr(r, "_sess", None)
-            # 框架fetch一般一次性返回；分片较小，直接全量拿
-            data = r.content if hasattr(r, "content") else b""
+            try:
+                r = self.fetch(seg_url, headers={"User-Agent": UA_PLAY},
+                               timeout=20)
+            except TypeError:
+                r = self.fetch(seg_url, headers={"User-Agent": UA_PLAY})
+            data = getattr(r, "content", b"") or b""
             if not data:
                 return None
             sps = self._find_sps(data[:max_bytes])
@@ -281,19 +282,18 @@ class Spider(_BaseSpider):
                     r.bit()
                 r.ue()
                 r.ue()
-                if r.bit():          # scaling_matrix 跳过
+                if r.bit():          # scaling_matrix_present
                     cnt = 8 if chroma != 3 else 12
-                    for i in range(cnt):
-                        if r.bit():
-                            size = 16 if i < 6 else 64
-                            last, nxt = 8, 8
+                    for _i in range(cnt):
+                        if r.bit():  # scaling_list_present_flag
+                            size = 16 if _i < 6 else 64
+                            last_scale, next_scale = 8, 8
                             for _ in range(size):
-                                if nxt:
-                                    d = r.se()
-                                    nxt = (last + d + 256) % 256
-                                last = 0 if (nxt != 0 and nxt != 0) and False else (nxt or last)
-                                if not nxt:
-                                    break
+                                if next_scale != 0:
+                                    delta = r.se()
+                                    next_scale = (last_scale + delta + 256) % 256
+                                if next_scale:
+                                    last_scale = next_scale
             r.ue()
             poc = r.ue()
             if poc == 0:
@@ -367,9 +367,13 @@ class Spider(_BaseSpider):
                 return pl.get("id"), None
 
         out: Dict[Any, Tuple[int, int]] = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-            for pl_id, res in ex.map(_probe_one, player_list or []):
-                out[pl_id] = res
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+                for pl_id, res in ex.map(_probe_one, player_list or []):
+                    out[pl_id] = res
+        except Exception as e:
+            self._log("probe: 并发探测失败(降级为名称识别): %s" % e)
+            out = {}
         self._log("probe: %s" % {k: v for k, v in out.items()})
         self._set_cache(cache_key, out)
         return out
@@ -488,7 +492,8 @@ class Spider(_BaseSpider):
             classes.append({"type_id": tid, "type_name": tname})
 
             flist = []
-            for group in node.get("children", []) or []:
+            children = (node.get("children") or []) if isinstance(node, dict) else []
+            for group in children:
                 gname = str(self._sg(group, "name", ""))
                 gkey = FILTER_GROUP_KEY.get(gname)
                 leaves = group.get("children", []) or []
@@ -557,8 +562,10 @@ class Spider(_BaseSpider):
             self.headers["token"] = data.get("token", "") or ""
             self._log("init: userid=%s" % self.userid)
         except Exception as e:
-            self._log("init: 游客信息失败: %s" % e)
-            raise
+            # 降级：拿不到游客身份也先让分类/搜索可用
+            self.userid = ""
+            self.headers["token"] = ""
+            self._log("init: 游客信息失败(降级运行): %s" % e)
 
     def homeContent(self, filter=False):
         """分类 + 筛选（直接来自 screenType 树，真机验证）"""
@@ -571,14 +578,32 @@ class Spider(_BaseSpider):
             result = self._api("/api/v1/app/screen/screenType")
             tree = (result.get("data", []) if result else []) or []
             classes, filters = self._build_filters_from_tree(tree)
+            if not classes:
+                # 接口返回空/业务码异常 → 静态兜底（分类绝不能空）
+                self._log("homeContent: 接口空数据, 使用静态兜底")
+                classes, filters = self._fallback_classes()
             self._log("homeContent: %d 分类, %d 分类带筛选"
                       % (len(classes), len(filters)))
             result_data = {"class": classes, "filters": filters}
             self._set_cache(cache_key, result_data)
             return result_data
         except Exception as e:
-            self._log("homeContent FAIL: %s" % e)
-            return {"class": [], "filters": {}}
+            self._log("homeContent FAIL: %s (使用静态兜底)" % e)
+            classes, filters = self._fallback_classes()
+            return {"class": classes, "filters": filters}
+
+    @staticmethod
+    def _fallback_classes(self=None):
+        """静态分类兜底（真机验证过的6个分类id）"""
+        classes = [
+            {"type_id": "M15", "type_name": "电视剧"},
+            {"type_id": "M14", "type_name": "短剧"},
+            {"type_id": "M16", "type_name": "电影"},
+            {"type_id": "M17", "type_name": "动漫"},
+            {"type_id": "M18", "type_name": "综艺"},
+            {"type_id": "M396", "type_name": "动画片"},
+        ]
+        return classes, {}
 
     def homeVideoContent(self):
         """首页推荐（并发各板块）"""
