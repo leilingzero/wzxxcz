@@ -1,6 +1,6 @@
 # coding=utf-8
 """
-66大片网 www.66dpw.vip | TVBox Python 爬虫 
+66大片网 www.66dpw.vip | TVBox Python 爬虫
 关键:
   - 苹果CMS mxpro 模板解析
   - 破解播放页 player_aaaa 的 encrypt=2 地址: base64 -> URL decode
@@ -664,33 +664,6 @@ class Spider(Spider):
             "vod_play_url":  "$$$".join(play_url),
         }]}
 
-    # -------- 播放 --------
-    def _absolutize_key(self, url):
-        """把 m3u8 中的 AES-128 相对 key 地址改写为绝对地址。
-        站点流形如: #EXT-X-KEY:METHOD=AES-128,URI="enc.key"
-        部分播放器无法按 m3u8 所在目录解密, 会直接黑屏 -> 走本地代理输出改写后的 playlist。
-        """
-        if not url or ".m3u8" not in url.lower():
-            return url
-        try:
-            rsp = self.fetch(url, headers={
-                "User-Agent": UA,
-                "Referer": self.site_url + "/",
-            }, timeout=15)
-            text = rsp.text if hasattr(rsp, "text") else ""
-        except Exception as e:
-            self.log("  m3u8 预取失败: %s" % e)
-            return url
-        if not text or "#EXTM3U" not in text:
-            return url
-        # 相对 key 无需改写, 直接返回原地址(避免多余代理)
-        m = re.search(r'#EXT-X-KEY:([^\n]*?)URI="([^"]+)"', text)
-        if not m or m.group(2).startswith("http"):
-            return url
-        self.log("  ⚠️ 检测到相对 key('%s'), 走代理改写" % m.group(2))
-        # TVBox 会把 {host}/proxy?url=xxx 路由到本爬虫的 localProxy
-        return "{host}" + "/proxy?url=" + urllib.parse.quote(url, safe="")
-
     # -------- 自动换源 --------
     def _vod_id(self, play_page):
         m = re.search(r"/vodplay/(\d+)-", play_page)
@@ -775,7 +748,6 @@ class Spider(Spider):
                 if vod_id and ep_idx:
                     alt = self._find_direct_line(vod_id, ep_idx)
                     if alt:
-                        alt = self._absolutize_key(alt)
                         self.log("  ★ 自动换源成功: %s" % alt[:120])
                         res = {
                             "parse": 0, "playUrl": "", "url": alt,
@@ -792,7 +764,6 @@ class Spider(Spider):
                 return res
 
             # 直链 m3u8/mp4
-            real_url = self._absolutize_key(real_url)
             res = {
                 "parse": 0,
                 "playUrl": "",
