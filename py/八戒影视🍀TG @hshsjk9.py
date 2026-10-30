@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 八戒影视 Spider（hipy / CatVod 类爬虫框架适配）V3 — 真机字段校准版
-已用真实接口 (82.156.118.137:88) 逐字段验证:
+已用真实接口 (82.156.118.137:88      http://osstexll.oss-rg-china-mainland.aliyuncs.com/domainPath.json) 逐字段验证:
   - screenType: 树形结构，一级分类(M15电视剧/M16电影/M14短剧/M17动漫/M18综艺/M396动画片)
     children 为筛选组(地区/类型/年份)，叶子 name 即筛选值(如"内地","古装","2025")
   - screenMovie condition: {classify:类型中文名, region:地区中文名,
