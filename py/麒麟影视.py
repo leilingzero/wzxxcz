@@ -73,7 +73,17 @@ CLASSES = [
     {"type_id": "23", "type_name": "漫剧"},
 ]
 
-# 与网站筛选栏完全一致 (剧情 / 年代 / 地区)
+# 与网站筛选栏完全一致 (分类=子类型ID / 剧情 / 年代 / 地区)
+# 子类型 ID 取自网站 /vod/show/id/{tid}.html 筛选栏链接
+_SUBTYPE = {
+    "1": [("10", "动作片"), ("11", "恐怖片"), ("12", "科幻片"),
+          ("13", "战争片"), ("14", "爱情片"), ("15", "喜剧片"),
+          ("16", "剧情片"), ("17", "记录片")],
+    "2": [("6", "内地剧"), ("7", "港台剧"), ("8", "日韩剧"),
+          ("9", "欧美剧"), ("22", "泰剧")],
+    "4": [("18", "内地番"), ("19", "日韩番"), ("20", "港台番"),
+          ("21", "欧美番")],
+}
 _CLASS_MAP = {
     "1": ["剧情", "悬疑", "恐怖", "惊悚", "喜剧", "爱情", "犯罪", "动作",
           "动画", "奇幻", "音乐", "科幻", "历史", "战争", "冒险", "家庭",
@@ -91,33 +101,39 @@ _YEARS = [{"n": "全部", "v": ""}] + \
          [{"n": str(y), "v": str(y)} for y in range(2026, 1999, -1)]
 _AREAS = [
     {"n": "全部", "v": ""},
-    {"n": "中国大陆", "v": "中国大陆"}, {"n": "中国香港", "v": "中国香港"},
-    {"n": "中国台湾", "v": "中国台湾"}, {"n": "美国", "v": "美国"},
-    {"n": "韩国", "v": "韩国"}, {"n": "日本", "v": "日本"},
-    {"n": "法国", "v": "法国"}, {"n": "英国", "v": "英国"},
+    {"n": "美国", "v": "美国"}, {"n": "法国", "v": "法国"},
+    {"n": "中国", "v": "中国"}, {"n": "日本", "v": "日本"},
+    {"n": "韩国", "v": "韩国"}, {"n": "中国香港", "v": "中国香港"},
+    {"n": "俄罗斯", "v": "俄罗斯"}, {"n": "波兰", "v": "波兰"},
     {"n": "德国", "v": "德国"}, {"n": "意大利", "v": "意大利"},
-    {"n": "西班牙", "v": "西班牙"}, {"n": "俄罗斯", "v": "俄罗斯"},
-    {"n": "波兰", "v": "波兰"}, {"n": "加拿大", "v": "加拿大"},
-    {"n": "澳大利亚", "v": "澳大利亚"}, {"n": "泰国", "v": "泰国"},
+    {"n": "中国台湾", "v": "中国台湾"}, {"n": "澳大利亚", "v": "澳大利亚"},
+    {"n": "西班牙", "v": "西班牙"}, {"n": "英国", "v": "英国"},
+    {"n": "加拿大", "v": "加拿大"}, {"n": "泰国", "v": "泰国"},
     {"n": "印度", "v": "印度"}, {"n": "丹麦", "v": "丹麦"},
-    {"n": "瑞典", "v": "瑞典"}, {"n": "挪威", "v": "挪威"},
-    {"n": "冰岛", "v": "冰岛"}, {"n": "爱尔兰", "v": "爱尔兰"},
-    {"n": "保加利亚", "v": "保加利亚"}, {"n": "马来西亚", "v": "马来西亚"},
-    {"n": "菲律宾", "v": "菲律宾"}, {"n": "阿根廷", "v": "阿根廷"},
-    {"n": "中国", "v": "中国"},
+    {"n": "中国大陆", "v": "中国大陆"}, {"n": "马来西亚", "v": "马来西亚"},
+    {"n": "菲律宾", "v": "菲律宾"}, {"n": "瑞典", "v": "瑞典"},
+    {"n": "挪威", "v": "挪威"}, {"n": "阿根廷", "v": "阿根廷"},
+    {"n": "冰岛", "v": "冰岛"}, {"n": "保加利亚", "v": "保加利亚"},
+    {"n": "爱尔兰", "v": "爱尔兰"},
 ]
 
 FILTERS = {}
 for c in CLASSES:
     tid = c["type_id"]
+    subs = _SUBTYPE.get(tid, [])
     cls = _CLASS_MAP.get(tid, [])
-    FILTERS[tid] = [
-        {"key": "class", "name": "剧情",
-         "value": [{"n": "全部", "v": ""}] +
-                  [{"n": x, "v": x} for x in cls]},
-        {"key": "area", "name": "地区", "value": _AREAS},
-        {"key": "year", "name": "年份", "value": _YEARS},
-    ]
+    fl = []
+    if subs:
+        fl.append({"key": "type", "name": "分类",
+                   "value": [{"n": "全部", "v": ""}] +
+                            [{"n": n, "v": v} for v, n in subs]})
+    if cls:
+        fl.append({"key": "class", "name": "剧情",
+                   "value": [{"n": "全部", "v": ""}] +
+                            [{"n": x, "v": x} for x in cls]})
+    fl.append({"key": "year", "name": "年代", "value": _YEARS})
+    fl.append({"key": "area", "name": "地区", "value": _AREAS})
+    FILTERS[tid] = fl
 
 
 # ===================== 正则 =====================
@@ -316,10 +332,13 @@ class Spider(Spider):
     def _page_count(self, html):
         if not html:
             return 1
-        m = _RE_TOTAL_PAGE.search(html)
+        # 优先: "共 10855 部" -> ceil(总数/每页24)
+        m = re.search(r'共\s*(\d+)\s*部', html)
         if m:
             try:
-                return int(m.group(1))
+                total = int(m.group(1))
+                if total > 0:
+                    return (total + 23) // 24
             except Exception:
                 pass
         pages = re.findall(r'/page/(\d+)\.html', html)
@@ -341,8 +360,9 @@ class Spider(Spider):
         return {"list": videos}
 
     def _build_show_url(self, tid, page, extend):
-        """构建与网站完全一致的列表/筛选 URL"""
-        base = "%s/index.php/vod/show/id/%s" % (self.site_url, tid)
+        """构建与网站完全一致的筛选 URL (子分类ID替换主ID, 与网站链接一致)"""
+        real_id = extend.get("type") or tid
+        base = "%s/index.php/vod/show/id/%s" % (self.site_url, real_id)
         segs = []
         if extend.get("class"):
             segs.append("class/" + urllib.parse.quote(str(extend["class"])))
@@ -489,11 +509,42 @@ class Spider(Spider):
         except Exception:
             pass
 
-        # ===== 线路 & 剧集 (与网站 line-tabs + ep-chip 一致) =====
+        # ===== 元信息 (与网站 meta-row 一致) =====
+        vod_year = vod_area = vod_lang = ""
+        vod_class = ""
+        try:
+            rows = re.findall(
+                r'<div class="meta-row[^"]*">([\s\S]*?)</div>', html)
+            if rows:
+                # 第一行: 年份 / 地区 / 语言
+                for m in re.finditer(
+                        r'<a href="[^"]*"[^>]*title="([^"]*)"', rows[0]):
+                    t = self._clean(m.group(1))
+                    if re.match(r"^(19|20)\d{2}$", t):
+                        vod_year = t
+                    elif not vod_area:
+                        vod_area = t
+                    elif not vod_lang:
+                        vod_lang = t
+            # 第二行: 类型 (首个是子分类名, 其余为剧情标签)
+            if len(rows) > 1:
+                tags = [self._clean(x) for x in
+                        re.findall(r'<a href="[^"]*"[^>]*title="([^"]*)"', rows[1])]
+                tags = [x for x in tags if x]
+                if tags:
+                    vod_class = ",".join(tags)
+        except Exception as e:
+            self.log("  元信息解析失败: %s" % e)
+        self.log("  元信息: year=%s area=%s lang=%s class=%s" % (
+            vod_year, vod_area, vod_lang, vod_class))
+
+        # ===== 线路 & 剧集 (与网站 line-tabs + ep-chip 一致, 顺序同网站) =====
         line_names = {}
+        line_tabs_order = []  # 保持网站 tab 出现顺序
         try:
             for m in _RE_LINE_TAB.finditer(html):
                 line_names[m.group(1)] = m.group(2).strip()
+                line_tabs_order.append((m.group(1), m.group(2).strip()))
         except Exception:
             pass
         self.log("  线路: %s" % line_names)
@@ -514,11 +565,17 @@ class Spider(Spider):
         if not groups:
             return {"list": []}
 
+        # 线路顺序 = 网站 line-tabs 出现顺序 (XG/WSY/DYTT/QY/JJ/FF ...)
+        ordered_sids = [s for s, _ in line_tabs_order if s in groups]
+        for s in groups:
+            if s not in ordered_sids:
+                ordered_sids.append(s)
+
         play_from = []
         play_url = []
-        for sid in sorted(groups.keys(), key=lambda x: int(x) if x.isdigit() else 99):
+        for sid in ordered_sids:
             eps = sorted(groups[sid], key=lambda x: x[0])
-            alias = line_names.get(sid) or _LINE_ALIAS.get(sid, "线路%s" % sid)
+            alias = line_names.get(sid) or ("线路%s" % sid)
             play_from.append(alias)
             play_url.append("#".join("%s$%s" % (n, h) for _, n, h in eps))
 
@@ -530,6 +587,10 @@ class Spider(Spider):
             "vod_actor": actor,
             "vod_director": director,
             "vod_score": score,
+            "vod_class": vod_class,
+            "vod_area": vod_area,
+            "vod_year": vod_year,
+            "vod_lang": vod_lang,
             "vod_remarks": ("共%d条线路" % len(groups)) if len(groups) > 1 else "",
             "vod_play_from": "$$$".join(play_from),
             "vod_play_url":  "$$$".join(play_url),
