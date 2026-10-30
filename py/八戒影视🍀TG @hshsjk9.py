@@ -928,13 +928,22 @@ class Spider(_BaseSpider):
                 self._log("player: 无播放URL")
                 return self._empty_play()
 
-            analysis = self._api(
-                "/api/v1/app/play/analysisMovieUrl?playerUrl=%s&playerId=%s"
-                % (quote(str(parse_url), safe=""), playerid),
-                method="GET")
-            url = (analysis.get("data", "") if analysis else "") or ""
-            if isinstance(url, dict):
-                url = url.get("url", "") or ""
+            url = self._resolve_play_url(parse_url, playerid)
+
+            # ===== 终极兜底：解析结果是网页而非媒体直链 =====
+            # 源站部分片源(爱奇艺等)analysisMovieUrl 解析失败会原样
+            # 返回网页地址，parse=0 会导致盒子黑屏 → 交给嗅探
+            if url and not self._is_media_url(url):
+                # 二次尝试：playerId 转整型再解析一次
+                url2 = self._resolve_play_url(
+                    parse_url, self._to_int(playerid, playerid))
+                if url2 and self._is_media_url(url2):
+                    url = url2
+                else:
+                    self._log("player: 非媒体直链, 交给嗅探: %s"
+                              % str(url)[:120])
+                    return {"jx": "0", "parse": "1", "url": str(url),
+                            "header": {"User-Agent": UA_PLAY}}
 
             self._log("player: %s" % str(url)[:160])
             return {"jx": "0", "parse": "0", "url": url,
@@ -942,6 +951,23 @@ class Spider(_BaseSpider):
         except Exception as e:
             self._log("playerContent FAIL: %s" % e)
             return self._empty_play()
+
+    def _resolve_play_url(self, parse_url, playerid):
+        """调用 analysisMovieUrl 解析真实直链"""
+        analysis = self._api(
+            "/api/v1/app/play/analysisMovieUrl?playerUrl=%s&playerId=%s"
+            % (quote(str(parse_url), safe=""), playerid),
+            method="GET")
+        url = (analysis.get("data", "") if analysis else "") or ""
+        if isinstance(url, dict):
+            url = url.get("url", "") or ""
+        return url
+
+    @staticmethod
+    def _is_media_url(url: str) -> bool:
+        u = str(url).lower().split("?")[0]
+        return (".m3u8" in u or ".mp4" in u or ".flv" in u
+                or ".ts" in u or ".mkv" in u)
 
     def _empty_play(self):
         return {"jx": "0", "parse": "0", "url": "", "header": {}}
