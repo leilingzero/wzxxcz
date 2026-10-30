@@ -1,22 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-八戒影视 Spider（hipy / CatVod 类爬虫框架适配）
-关键:
-  - 通过 oss domainPath.json 动态获取站点 host
-  - visitorInfo 获取游客 userId / token
-  - 短剧(M16)虚拟分集 + 普通影片真实分集 双模式
+八戒影视 Spider（hipy / CatVod 类爬虫框架适配）V3 — 真机字段校准版
+已用真实接口 (82.156.118.137:88) 逐字段验证:
+  - screenType: 树形结构，一级分类(M15电视剧/M16电影/M14短剧/M17动漫/M18综艺/M396动画片)
+    children 为筛选组(地区/类型/年份)，叶子 name 即筛选值(如"内地","古装","2025")
+  - screenMovie condition: {classify:类型中文名, region:地区中文名,
+    sreecnTypeEnum:NEWEST, typeId, year} —— 全部传中文名，组合筛选已验证生效
+  - 列表项字段: id / typeId / cover / name / type / desc / year / area / source
+  - movieDetails: episodeList[{id,episode,lock}] / moviePlayerList[
+    {id,moviePlayerName,episodeTotal}] (如 腾讯 / 4K-YKT)
+  - movieDesc: introduce / star(演员!) / director / classify / area / year / score / watch
 本资源来源于互联网公开渠道，仅可用于个人学习爬虫技术。
-严禁将其用于任何商业用途，下载后请于 24 小时内删除，
-搜索结果均来自源站，作者不承担任何责任。
-
-使用方式：
-  - 作为 CatVod / hipy 爬虫模块：由框架加载 Spider 类并调用其接口。
-  - 独立运行（python bajie_spider.py）：仅执行 init() 自测，验证能否
-    成功拉取 domainPath、获取 visitorInfo 的 userId/token。
+严禁将其用于任何商业用途，下载后请于 24 小时内删除。
 """
 
 import sys
 import os
+import re
 import json
 import time
 import concurrent.futures
@@ -36,8 +36,6 @@ except ImportError:
         pass
 
     class _BaseSpider:
-        """独立运行时的占位基类，仅提供 fetch/post 兜底实现。"""
-
         def __init__(self):
             self._session = None
 
@@ -83,14 +81,26 @@ UA_PLAY = ("Mozilla/5.0 (iPhone; CPU iPhone OS 13_2_3 like Mac OS X) "
 
 INTRO_PREFIX = "🍊小橙子为您介绍剧情👉请不要相信视频中的广告，以免上当受骗！"
 
-# 短剧类型 / 关键词
-SHORT_TYPE_ID = "M16"
-SHORT_KEYWORDS = ("合集", "短剧", "RO", "分剧", "分集")
-SHORT_EP_MAX = 500      # 短剧虚拟分集上限
-NORMAL_EP_MAX = 200     # 普通片虚拟分集上限
-SHORT_EP_THRESHOLD = 80  # 集数超过此值视为短剧
+DEVICE_ID = "2d590b9842d064a1"
 
-# 缓存 TTL（秒）
+# 筛选组名 → screenMovie condition 参数名（真机验证）
+FILTER_GROUP_KEY = {"地区": "region", "类型": "classify", "年份": "year"}
+
+# 清晰度识别：数值越大越清晰（用于线路排序）
+_QUALITY_RULES = (
+    (r"4k|2160p|uhd|蓝光4k|原画", 100),
+    (r"1080p|fhd|超清|蓝光|bd|bluray", 80),
+    (r"720p|hd\b|高清|hdrip", 60),
+    (r"480p|sd|标清", 40),
+    (r"360p|流畅|极速|省流", 20),
+)
+_QUALITY_TAG = {100: "4K", 80: "1080P", 60: "720P", 40: "480P", 20: "流畅"}
+
+SHORT_KEYWORDS = ("合集", "短剧", "RO", "分剧", "分集")
+SHORT_EP_MAX = 500
+NORMAL_EP_MAX = 200
+SHORT_EP_THRESHOLD = 80
+
 TTL_HOME = 600
 TTL_HOME_VIDEO = 300
 TTL_CATEGORY = 120
@@ -112,114 +122,189 @@ class Spider(_BaseSpider):
         "Content-Type": "application/json;charset=UTF-8",
         "Cache-Control": "no-cache",
         "token": "",
-        "deviceId": "",
+        "deviceId": DEVICE_ID,
         "client": "app",
         "deviceType": "Android",
     }
 
-    # ---------- 辅助方法 ----------
-    def _safe_get(self, data: Dict, key: str, default: Any = "") -> Any:
-        """安全获取字典值，避免 KeyError"""
-        if not isinstance(data, dict):
-            return default
-        v = data.get(key, default)
-        return default if v is None else v
-
+    # ---------- 基础 ----------
     def _log(self, *a):
         try:
             print("[bajie]", *a)
         except Exception:
             pass
 
-    def _build_video_item(self, data: Dict,
-                          extra_fields: Optional[List[str]] = None) -> Dict:
-        """构建标准的视频项字典"""
-        item = {
-            "vod_id": self._safe_get(data, "id"),
-            "vod_name": self._safe_get(data, "name", "未知影片"),
-            "vod_pic": self._safe_get(data, "cover", ""),
-            "vod_remarks": self._safe_get(data, "area", ""),
-            "vod_year": self._safe_get(data, "year", ""),
-        }
-        if extra_fields:
-            for field in extra_fields:
-                item[f"vod_{field}"] = self._safe_get(data, field, "")
-        return item
+    def _sg(self, data: Dict, key: str, default: Any = "") -> Any:
+        if not isinstance(data, dict):
+            return default
+        v = data.get(key, default)
+        return default if v is None else v
 
-    def _safe_request(self, url: str, payload: Dict = None, method: str = "POST",
-                      max_retries: int = 3, retry_delay: int = 1) -> Optional[Dict]:
-        """安全请求：带重试 + 业务码校验"""
+    def _to_int(self, v, default: int = 0) -> int:
+        try:
+            return int(str(v).strip())
+        except Exception:
+            return default
+
+    # ---------- 清晰度 ----------
+    def _quality_score(self, text: str) -> int:
+        if not text:
+            return 0
+        t = str(text).lower()
+        best = 0
+        for pattern, score in _QUALITY_RULES:
+            if re.search(pattern, t):
+                best = max(best, score)
+        return best
+
+    def _player_quality(self, pl: Dict) -> Tuple[int, str]:
+        """真机字段 moviePlayerName（如 4K-YKT / 腾讯），文本识别清晰度"""
+        name = str(self._sg(pl, "moviePlayerName", ""))
+        sc = self._quality_score(name)
+        return sc, _QUALITY_TAG.get(sc, "")
+
+    def _label_player(self, pl: Dict, used: set) -> str:
+        base = str(self._sg(pl, "moviePlayerName", "")).strip() or \
+            ("线路%s" % pl.get("id", ""))
+        _, tag = self._player_quality(pl)
+        if tag and tag.lower() not in base.lower():
+            base = "%s [%s]" % (base, tag)
+        name, i = base, 2
+        while name in used:
+            name = "%s(%d)" % (base, i)
+            i += 1
+        used.add(name)
+        return name
+
+    def _sorted_players(self, player_list: List, current_id) -> List[Dict]:
+        """清晰度高→低；标清以下(不含4K/1080P/720P字样)沉底；当前源优先"""
+        def _key(pl):
+            score, _ = self._player_quality(pl)
+            is_cur = 1 if pl.get("id") == current_id else 0
+            low = 0 if score >= 60 else 1
+            return (low, -score, -is_cur)
+        return sorted(player_list or [], key=_key)
+
+    # ---------- 列表项 ----------
+    def _build_video_item(self, data: Dict) -> Dict:
+        """真机字段: id/cover/name/type/desc/year/area"""
+        return {
+            "vod_id": self._sg(data, "id"),
+            "vod_name": self._sg(data, "name", "未知影片"),
+            "vod_pic": self._sg(data, "cover", ""),
+            # 角标优先用类型（如"都市,剧情"），其次地区
+            "vod_remarks": self._sg(data, "type",
+                                    self._sg(data, "area", "")),
+            "vod_year": self._sg(data, "year", ""),
+            "vod_area": self._sg(data, "area", ""),
+        }
+
+    # ---------- 请求 ----------
+    def _api(self, path: str, payload: Dict = None, method: str = "POST",
+             max_retries: int = 3) -> Optional[Dict]:
+        url = "%s%s" % (self.host, path)
         for attempt in range(max_retries):
             try:
                 if method.upper() == "POST":
-                    resp = self.post(
-                        url,
-                        data=json.dumps(payload) if payload is not None else None,
-                        headers=self.headers,
-                    )
+                    resp = self.post(url, data=json.dumps(payload)
+                                     if payload is not None else None,
+                                     headers=self.headers)
                 else:
                     resp = self.fetch(url, headers=self.headers)
-
                 if resp.status_code == 200:
                     result = resp.json()
                     code = result.get("code", 200)
                     if code in (200, 0):
                         return result
-                    msg = result.get("msg", result.get("message", "未知错误"))
-                    self._log("[API错误] code=%s, msg=%s" % (code, msg))
+                    self._log("[API错误] code=%s msg=%s %s"
+                              % (code, result.get("msg", ""), path))
                     if attempt < max_retries - 1:
-                        time.sleep(retry_delay)
+                        time.sleep(1)
                         continue
                     return None
-                else:
-                    self._log("[HTTP错误] status=%s url=%s"
-                              % (resp.status_code, url))
-                    if attempt < max_retries - 1:
-                        time.sleep(retry_delay)
-                        continue
-                    return None
-            except Exception as e:
-                self._log("[请求失败] 尝试 %d/%d: %s"
-                          % (attempt + 1, max_retries, e))
+                self._log("[HTTP错误] %s %s" % (resp.status_code, path))
                 if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
+                    time.sleep(1)
+                    continue
+                return None
+            except Exception as e:
+                self._log("[请求失败] %d/%d %s: %s"
+                          % (attempt + 1, max_retries, path, e))
+                if attempt < max_retries - 1:
+                    time.sleep(1)
                     continue
                 return None
         return None
 
-    def _get_cache(self, key: str, ttl: int = 300) -> Optional[Any]:
-        """获取缓存（带 TTL）"""
+    def _get_cache(self, key: str, ttl: int = 300):
         if key in self._cache:
-            cache_data, timestamp = self._cache[key]
-            if time.time() - timestamp < ttl:
-                return cache_data
+            data, ts = self._cache[key]
+            if time.time() - ts < ttl:
+                return data
             del self._cache[key]
         return None
 
     def _set_cache(self, key: str, value: Any):
-        """设置缓存"""
         self._cache[key] = (value, time.time())
+
+    # ---------- 筛选树（真机结构） ----------
+    def _build_filters_from_tree(self, tree: List) -> Tuple[List[Dict], Dict]:
+        """
+        screenType 树 → (classes, filters)
+        一级节点 = 分类；其 children = 筛选组(地区/类型/年份)；
+        叶子 name 直接作为筛选值传给 screenMovie condition。
+        """
+        classes: List[Dict] = []
+        filters: Dict[str, List[Dict]] = {}
+
+        for node in tree or []:
+            tid = str(self._sg(node, "id", ""))
+            tname = str(self._sg(node, "name", ""))
+            if not tid or not tname:
+                continue
+            classes.append({"type_id": tid, "type_name": tname})
+
+            flist = []
+            for group in node.get("children", []) or []:
+                gname = str(self._sg(group, "name", ""))
+                gkey = FILTER_GROUP_KEY.get(gname)
+                leaves = group.get("children", []) or []
+                if not gkey or not leaves:
+                    continue
+                values = [{"n": "全部", "v": ""}] + [
+                    {"n": str(self._sg(leaf, "name")),
+                     "v": str(self._sg(leaf, "name"))}
+                    for leaf in leaves if self._sg(leaf, "name")
+                ]
+                flist.append({"key": gkey, "name": gname, "value": values})
+
+            # 排序固定补充（sreecnTypeEnum）
+            flist.append({"key": "sreecnTypeEnum", "name": "排序", "value": [
+                {"n": "最新上线", "v": "NEWEST"},
+                {"n": "最热播放", "v": "HOT"},
+                {"n": "评分最高", "v": "SCORE"},
+            ]})
+            if flist:
+                filters[tid] = flist
+
+        return classes, filters
 
     # ---------- 框架接口 ----------
     def getName(self):
         return "八戒影视"
 
     def init(self, extend=""):
-        """初始化：获取域名配置 + 游客认证信息"""
         try:
             self.extend = json.loads(extend) if extend else {}
         except Exception:
             self.extend = {}
-
         self._cache = {}
 
-        self.headers["deviceId"] = "2d590b9842d064a1"
-
-        # 1) 拉取域名路径配置（支持 BAJIE_HOST 环境变量手动指定）
+        # 1) host（支持 BAJIE_HOST 覆盖）
         cfg_host = os.environ.get("BAJIE_HOST", "").strip()
         if cfg_host:
             self.host = cfg_host.rstrip("/")
-            self._log("init: 使用环境变量指定 host: %s" % self.host)
+            self._log("init: 环境变量 host: %s" % self.host)
         else:
             try:
                 resp = self.fetch(DOMAIN_CFG_URL, headers={
@@ -228,109 +313,82 @@ class Spider(_BaseSpider):
                     "Accept-Encoding": "gzip",
                 })
                 j = resp.json()
-                if isinstance(j, dict) and j.get("status") in (403, 401, 400):
-                    raise RuntimeError(
-                        "domainPath.json 被源站拒绝访问(status=%s): %s。"
-                        "可通过环境变量 BAJIE_HOST=http://xxx 手动指定 host。"
-                        % (j.get("status"), j.get("detail") or j.get("title")))
                 urls = j.get("url") if isinstance(j, dict) else None
                 if not urls:
-                    raise RuntimeError(
-                        "domainPath.json 返回结构异常: " + str(j)[:200])
+                    raise RuntimeError("domainPath.json 无 url: "
+                                       + str(j)[:200])
                 self.host = str(urls[0]).rstrip("/")
-                self._log("init: 远程配置 host: %s" % self.host)
+                self._log("init: 远程 host: %s" % self.host)
             except Exception as e:
-                self._log("init: 获取域名配置失败: %s" % e)
+                self._log("init: 获取域名失败: %s" % e)
                 raise
 
-        # 2) 获取游客用户信息（userId / token）
+        # 2) 游客 token
         try:
-            resp = self.fetch(
-                "%s/api/v1/app/user/visitorInfo" % self.host,
-                headers=self.headers)
+            resp = self.fetch("%s/api/v1/app/user/visitorInfo" % self.host,
+                              headers=self.headers)
             data = resp.json().get("data", {}) or {}
             self.userid = str(data.get("id", "") or "")
             self.headers["token"] = data.get("token", "") or ""
-            self._log("init: 游客信息获取成功, userid=%s" % self.userid)
+            self._log("init: userid=%s" % self.userid)
         except Exception as e:
-            self._log("init: 获取游客信息失败: %s" % e)
+            self._log("init: 游客信息失败: %s" % e)
             raise
 
-    def homeContent(self, filter):
-        """获取首页分类列表"""
+    def homeContent(self, filter=False):
+        """分类 + 筛选（直接来自 screenType 树，真机验证）"""
         cache_key = "home_content"
         cached = self._get_cache(cache_key, ttl=TTL_HOME)
         if cached:
             return cached
 
         try:
-            result = self._safe_request(
-                "%s/api/v1/app/screen/screenType" % self.host, method="POST")
-            if not result:
-                return {"class": []}
-
-            data = result.get("data", []) or []
-            classes = [
-                {
-                    "type_id": self._safe_get(i, "id"),
-                    "type_name": self._safe_get(i, "name", "未命名分类"),
-                }
-                for i in data if self._safe_get(i, "id")
-            ]
-            self._log("homeContent: %d 个分类" % len(classes))
-            result_data = {"class": classes}
+            result = self._api("/api/v1/app/screen/screenType")
+            tree = (result.get("data", []) if result else []) or []
+            classes, filters = self._build_filters_from_tree(tree)
+            self._log("homeContent: %d 分类, %d 分类带筛选"
+                      % (len(classes), len(filters)))
+            result_data = {"class": classes, "filters": filters}
             self._set_cache(cache_key, result_data)
             return result_data
         except Exception as e:
             self._log("homeContent FAIL: %s" % e)
-            return {"class": []}
+            return {"class": [], "filters": {}}
 
     def homeVideoContent(self):
-        """获取首页推荐内容（并发拉取各推荐板块子列表）"""
+        """首页推荐（并发各板块）"""
         cache_key = "home_video"
         cached = self._get_cache(cache_key, ttl=TTL_HOME_VIDEO)
         if cached:
             return cached
 
         try:
-            result = self._safe_request(
-                "%s/api/v1/app/recommend/recommendList" % self.host,
-                method="POST")
-            if not result:
-                return {"list": []}
-
-            data = result.get("data", []) or []
-            videos = []
-            seen = set()
+            result = self._api("/api/v1/app/recommend/recommendList")
+            data = (result.get("data", []) if result else []) or []
+            videos, seen = [], set()
 
             def _collect(item_id):
-                sub = self._safe_request(
-                    "%s/api/v1/app/recommend/recommendSubList" % self.host,
-                    payload={"condition": item_id, "pageNum": 1,
-                             "pageSize": 6},
-                    method="POST")
-                out = []
-                if sub:
-                    for v in (sub.get("data", {}) or {}).get("records", []):
-                        out.append(v)
-                return out
+                sub = self._api("/api/v1/app/recommend/recommendSubList",
+                                {"condition": item_id, "pageNum": 1,
+                                 "pageSize": 6})
+                if not sub:
+                    return []
+                return (sub.get("data", {}) or {}).get("records", []) or []
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
-                futures = {
-                    ex.submit(_collect, item["id"]): item["id"]
-                    for item in data if self._safe_get(item, "id")
-                }
+                futures = {ex.submit(_collect, it["id"]): it["id"]
+                           for it in data if self._sg(it, "id")}
                 for fut in concurrent.futures.as_completed(futures):
                     try:
                         for v in fut.result():
-                            vid = self._safe_get(v, "id")
+                            vid = self._sg(v, "id")
                             if vid and vid not in seen:
                                 seen.add(vid)
                                 videos.append(self._build_video_item(v))
                     except Exception as e:
-                        self._log("homeVideoContent 子板块失败: %s" % e)
+                        self._log("推荐板块失败: %s" % e)
 
-            self._log("homeVideoContent: %d 个推荐视频" % len(videos))
+            self._log("homeVideoContent: %d 条" % len(videos))
             result_data = {"list": videos}
             self._set_cache(cache_key, result_data)
             return result_data
@@ -339,7 +397,10 @@ class Spider(_BaseSpider):
             return {"list": []}
 
     def categoryContent(self, tid, pg, filter, extend):
-        """获取分类内容（支持筛选条件 extend）"""
+        """
+        分类内容。extend 值即筛选叶子中文名（region/classify/year 直接传），
+        真机验证: region="内地" classify="古装" year="2025" 组合均生效。
+        """
         if isinstance(extend, str):
             try:
                 extend = json.loads(extend) if extend else {}
@@ -347,100 +408,84 @@ class Spider(_BaseSpider):
                 extend = {}
         if not isinstance(extend, dict):
             extend = {}
-        for k in list(extend.keys()):
-            if extend[k] in ("", None, "全部"):
-                del extend[k]
+        extend = {k: v for k, v in extend.items()
+                  if v not in ("", None, "全部", "不限")}
 
-        page = int(pg) if pg else 1
-        cache_key = "category_%s_%s_%s" % (tid, page, json.dumps(
-            extend, sort_keys=True, ensure_ascii=False))
+        page = self._to_int(pg, 1) or 1
+        cache_key = "category_%s_%s_%s" % (
+            tid, page, json.dumps(extend, sort_keys=True, ensure_ascii=False))
         cached = self._get_cache(cache_key, ttl=TTL_CATEGORY)
         if cached:
             return cached
 
         try:
             cond = {
-                "classify": extend.get("class", ""),
-                "region": extend.get("area", ""),
-                "sreecnTypeEnum": extend.get("sort_field", "NEWEST"),
+                "classify": extend.get("classify", ""),
+                "region": extend.get("region", ""),
+                "sreecnTypeEnum": extend.get("sreecnTypeEnum", "NEWEST"),
                 "typeId": tid,
                 "year": extend.get("year", ""),
             }
-            payload = {"condition": cond, "pageNum": page,
-                       "pageSize": PAGE_SIZE}
-
-            result = self._safe_request(
-                "%s/api/v1/app/screen/screenMovie" % self.host,
-                payload=payload, method="POST")
+            result = self._api("/api/v1/app/screen/screenMovie",
+                               {"condition": cond, "pageNum": page,
+                                "pageSize": PAGE_SIZE})
             if not result:
                 return {"list": [], "page": page, "pagecount": 1,
                         "limit": PAGE_SIZE, "total": 0}
 
             d = result.get("data", {}) or {}
             records = d.get("records", []) or []
-            total = int(d.get("total", 0) or 0)
+            total = self._to_int(d.get("total", 0), 0)
             pagecount = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+            videos = [self._build_video_item(i) for i in records]
 
-            videos = [self._build_video_item(i, ["area", "year"])
-                      for i in records]
-
-            self._log("category: tid=%s pg=%s -> %d 条"
-                      % (tid, page, len(videos)))
-            result_data = {
-                "list": videos, "page": page, "pagecount": pagecount,
-                "limit": PAGE_SIZE, "total": total,
-            }
+            self._log("category: tid=%s pg=%s %s -> %d 条"
+                      % (tid, page, cond, len(videos)))
+            result_data = {"list": videos, "page": page,
+                           "pagecount": pagecount, "limit": PAGE_SIZE,
+                           "total": total}
             self._set_cache(cache_key, result_data)
             return result_data
         except Exception as e:
-            self._log("categoryContent FAIL (tid=%s pg=%s): %s"
-                      % (tid, pg, e))
+            self._log("categoryContent FAIL (tid=%s): %s" % (tid, e))
             return {"list": [], "page": page, "pagecount": 1,
                     "limit": PAGE_SIZE, "total": 0}
 
     def searchContent(self, key, quick, pg="1"):
-        """搜索内容"""
-        page = int(pg) if pg else 1
+        page = self._to_int(pg, 1) or 1
         cache_key = "search_%s_%s" % (key, page)
         cached = self._get_cache(cache_key, ttl=TTL_SEARCH)
         if cached:
             return cached
 
         try:
-            payload = {"condition": {"value": key},
-                       "pageNum": page, "pageSize": PAGE_SIZE}
-
-            result = self._safe_request(
-                "%s/api/v1/app/search/searchMovie" % self.host,
-                payload=payload, method="POST")
+            result = self._api("/api/v1/app/search/searchMovie",
+                               {"condition": {"value": key},
+                                "pageNum": page, "pageSize": PAGE_SIZE})
             if not result:
                 return {"list": [], "page": page}
 
             d = result.get("data", {}) or {}
             records = d.get("records", []) or []
-            total = int(d.get("total", 0) or 0)
+            total = self._to_int(d.get("total", 0), 0)
             pagecount = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+            videos = [self._build_video_item(i) for i in records]
 
-            videos = [self._build_video_item(i, ["area", "year", "desc"])
-                      for i in records]
-
-            self._log("search: key='%s' pg=%s -> %d 条"
-                      % (key, page, len(videos)))
-            result_data = {
-                "list": videos, "page": page, "pagecount": pagecount,
-                "limit": PAGE_SIZE, "total": total,
-            }
+            self._log("search: '%s' pg=%s -> %d 条" % (key, page, len(videos)))
+            result_data = {"list": videos, "page": page,
+                           "pagecount": pagecount, "limit": PAGE_SIZE,
+                           "total": total}
             self._set_cache(cache_key, result_data)
             return result_data
         except Exception as e:
-            self._log("searchContent FAIL (key='%s'): %s" % (key, e))
+            self._log("searchContent FAIL: %s" % e)
             return {"list": [], "page": page}
 
     def searchContentPage(self, key, quick, pg="1"):
         return self.searchContent(key, quick, pg)
 
+    # ---------- 详情 ----------
     def detailContent(self, ids):
-        """获取影片详情（含短剧特殊处理 + 简介前缀）"""
         if not ids:
             return {"list": []}
         video_id = str(ids[0])
@@ -450,267 +495,234 @@ class Spider(_BaseSpider):
             return cached
 
         try:
-            payload = {"id": video_id, "source": 0, "typeId": "M17",
-                       "userId": self.userid}
-            result = self._safe_request(
-                "%s/api/v1/app/play/movieDetails" % self.host,
-                payload=payload, method="POST")
+            result = self._api("/api/v1/app/play/movieDetails",
+                               {"id": video_id, "source": 0, "typeId": "M17",
+                                "userId": self.userid})
             if not result:
                 return {"list": []}
-
             data = result.get("data", {}) or {}
             if not data:
-                self._log("detail: 影片 %s 无数据" % video_id)
+                self._log("detail: %s 无数据" % video_id)
                 return {"list": []}
 
-            # 简介独立接口，多层兜底
-            desc_result = self._safe_request(
-                "%s/api/v1/app/play/movieDesc" % self.host,
-                payload={"id": video_id, "typeId": "M17"}, method="POST")
+            desc_result = self._api("/api/v1/app/play/movieDesc",
+                                    {"id": video_id, "typeId": "M17"})
             d2 = (desc_result.get("data", {}) if desc_result else {}) or {}
 
             video_detail = self._build_detail_data(video_id, data, d2)
-
-            self._log("detail: %s -> 播放源 %s"
+            self._log("detail: %s | 线路: %s"
                       % (video_detail.get("vod_name"),
                          video_detail.get("vod_play_from")))
             result_data = {"list": [video_detail]}
             self._set_cache(cache_key, result_data)
             return result_data
         except Exception as e:
-            self._log("detailContent FAIL (ids=%s): %s" % (ids, e))
+            self._log("detailContent FAIL: %s" % e)
             return {"list": []}
 
     def _build_detail_data(self, video_id: str, data: Dict,
                            desc_data: Dict) -> Dict:
-        """构建影片详情数据（短剧/普通双模式 + 简介前缀）"""
-        currentplayerid = data.get("playerId", 0)
+        """
+        真机字段:
+          movieDetails: episodeList / moviePlayerList / playerId
+          movieDesc: introduce / star(演员) / director / classify /
+                     area / year / score / watch
+        """
+        current_id = data.get("playerId", 0)
         episode_list = data.get("episodeList", []) or []
-        movie_player_list = data.get("moviePlayerList", []) or []
+        player_list = data.get("moviePlayerList", []) or []
 
-        play_urls: List[str] = []
-        show: List[str] = []
-
-        if self._is_short_drama(data, movie_player_list):
+        if self._is_short_drama(data, player_list):
             play_urls, show = self._build_short_drama_playlist(
-                video_id, movie_player_list, currentplayerid)
+                video_id, player_list, current_id)
         else:
             play_urls, show = self._build_normal_playlist(
-                video_id, episode_list, movie_player_list, currentplayerid)
+                video_id, episode_list, player_list, current_id)
 
-        # 兜底：至少保证有一个可点的源
         if not play_urls:
             show = ["默认源"]
             play_urls = ["第1集$1@0@%s@virtual" % video_id]
 
-        # ===== 简介（多层兜底 + 指定前缀）=====
-        content = (
-            self._safe_get(desc_data, "introduce")
-            or self._safe_get(data, "introduce")
-            or self._safe_get(desc_data, "desc")
-            or self._safe_get(data, "desc")
-            or ""
-        ).strip()
-        content = (INTRO_PREFIX + "\n" + content) if content else INTRO_PREFIX
+        # ===== 简介: 前缀 + 副标题/元信息 + 正文 =====
+        intro = str(self._sg(desc_data, "introduce")
+                    or self._sg(data, "desc") or "").strip()
 
-        video = {
-            "vod_id": self._safe_get(desc_data, "id", video_id) or video_id,
-            "vod_name": (self._safe_get(desc_data, "name")
-                         or self._safe_get(data, "name", "未知影片")),
-            "vod_pic": (self._safe_get(desc_data, "cover")
-                        or self._safe_get(data, "cover", "")),
+        meta = []
+        alias = str(self._sg(desc_data, "subName")
+                    or self._sg(desc_data, "alias") or "").strip()
+        if alias:
+            meta.append("又名: %s" % alias)
+        bits = []
+        if self._sg(desc_data, "director"):
+            bits.append("导演: %s" % desc_data["director"])
+        if self._sg(desc_data, "star"):
+            bits.append("主演: %s" % desc_data["star"])
+        if self._sg(desc_data, "classify"):
+            bits.append("类型: %s" % desc_data["classify"])
+        if bits:
+            meta.append(" / ".join(bits))
+        watch = self._sg(desc_data, "watch")
+        if watch:
+            meta.append("热度: %s" % watch)
+
+        parts = [INTRO_PREFIX]
+        parts.extend(meta)
+        if intro:
+            parts.append(intro)
+        content = "\n".join(parts)
+
+        # 备注: 最高清晰度标签 + 线路数（从真实 playerList 判断，不受改名影响）
+        best_tag = ""
+        best_score = 0
+        for pl in player_list or []:
+            sc, tg = self._player_quality(pl)
+            if sc > best_score:
+                best_score, best_tag = sc, tg
+        remarks = ("%s · %d条线路" % (best_tag, len(show))
+                   if best_tag else "%d条线路" % len(show))
+
+        return {
+            "vod_id": video_id,
+            "vod_name": (self._sg(desc_data, "name")
+                         or self._sg(data, "name", "未知影片")),
+            "vod_pic": (self._sg(desc_data, "cover")
+                        or self._sg(data, "cover", "")),
             "vod_content": content,
-            "vod_year": (self._safe_get(desc_data, "year")
-                         or self._safe_get(data, "year", "")),
-            "vod_area": (self._safe_get(desc_data, "area")
-                         or self._safe_get(data, "area", "")),
-            "vod_remarks": (self._safe_get(desc_data, "score")
-                            or "%d条线路" % len(show)),
-            "vod_score": (self._safe_get(desc_data, "score")
-                          or self._safe_get(data, "score", "")),
-            "type_name": (self._safe_get(desc_data, "classify")
-                          or self._safe_get(data, "classify", "")),
-            "vod_director": (self._safe_get(desc_data, "director")
-                             or self._safe_get(data, "director", "")),
-            "vod_actor": self._safe_get(desc_data, "actor",
-                                        self._safe_get(data, "actor", "")),
+            "vod_year": (self._sg(desc_data, "year")
+                         or self._sg(data, "year", "")),
+            "vod_area": (self._sg(desc_data, "area")
+                         or self._sg(data, "area", "")),
+            "vod_remarks": remarks,
+            "vod_score": str(self._sg(desc_data, "score", "")),
+            "type_name": (self._sg(desc_data, "classify")
+                          or self._sg(data, "type", "")),
+            "vod_director": str(self._sg(desc_data, "director", "")),
+            "vod_actor": str(self._sg(desc_data, "star", "")),
             "vod_play_from": "$$$".join(show),
             "vod_play_url": "$$$".join(play_urls),
         }
-        return video
 
     def _is_short_drama(self, data: Dict, player_list: List) -> bool:
-        """判断是否为短剧：类型ID / 类型名 / 播放源名 / 集数 多层兜底"""
-        if self._safe_get(data, "typeId") == SHORT_TYPE_ID:
-            return True
-
-        type_name = (self._safe_get(data, "typeName")
-                     or self._safe_get(data, "classify") or "")
+        type_name = str(self._sg(data, "typeName")
+                        or self._sg(data, "classify") or "")
         if "短剧" in type_name:
             return True
-
-        for pl in player_list:
-            pl_name = self._safe_get(pl, "moviePlayerName", "")
-            if any(kw in pl_name for kw in SHORT_KEYWORDS):
+        for pl in player_list or []:
+            if any(kw in str(self._sg(pl, "moviePlayerName", ""))
+                   for kw in SHORT_KEYWORDS):
                 return True
-
-        for pl in player_list:
-            if (self._safe_get(pl, "episodeTotal", 0) or 0) \
+        for pl in player_list or []:
+            if self._to_int(self._sg(pl, "episodeTotal", 0)) \
                     > SHORT_EP_THRESHOLD:
                 return True
-
         return False
 
-    def _build_short_drama_playlist(self, video_id: str, player_list: List,
-                                    current_id: int) -> Tuple[List[str], List[str]]:
-        """构建短剧播放列表：每个播放源独立生成虚拟分集"""
-        play_urls: List[str] = []
-        show: List[str] = []
-
-        for pl in player_list:
-            pl_id = pl.get("id")
-            episode_total = pl.get("episodeTotal")
-            pl_name = self._safe_get(pl, "moviePlayerName", "未知源")
-
-            if not episode_total or int(episode_total) <= 0:
+    def _build_short_drama_playlist(self, video_id, player_list,
+                                    current_id) -> Tuple[List[str], List[str]]:
+        play_urls, show, used = [], [], set()
+        for pl in self._sorted_players(player_list, current_id):
+            ep_total = self._to_int(self._sg(pl, "episodeTotal", 0))
+            if ep_total <= 0:
                 continue
-
-            pu = [
-                "第%d集$%d@%s@%s@virtual"
-                % (ep, ep, pl_id, video_id)
-                for ep in range(1, min(int(episode_total) + 1, SHORT_EP_MAX))
-            ]
+            pu = ["第%d集$%d@%s@%s@virtual" % (ep, ep, pl.get("id"), video_id)
+                  for ep in range(1, min(ep_total + 1, SHORT_EP_MAX))]
             if pu:
                 play_urls.append("#".join(pu))
-                show.append(pl_name)
-
+                show.append(self._label_player(pl, used))
         return play_urls, show
 
-    def _build_normal_playlist(self, video_id: str, episode_list: List,
-                               player_list: List,
-                               current_id: int) -> Tuple[List[str], List[str]]:
-        """构建普通剧集播放列表：优先真实分集，其余源虚拟分集"""
-        play_urls: List[str] = []
-        show: List[str] = []
+    def _build_normal_playlist(self, video_id, episode_list, player_list,
+                               current_id) -> Tuple[List[str], List[str]]:
+        """真机 episodeList: [{id, episode:'第1集', lock}]"""
+        play_urls, show, used = [], [], set()
+        done_ids = set()
 
         if episode_list:
-            # 当前播放源名称
-            current_source_name = "默认源"
-            for pl in player_list:
-                if pl.get("id") == current_id:
-                    current_source_name = self._safe_get(
-                        pl, "moviePlayerName", "默认源")
-                    break
-
-            play_url = [
-                "%s$%s@%s@%s@episode"
-                % (self._safe_get(ep, "episode", str(idx + 1)),
-                   video_id, current_id,
-                   self._safe_get(ep, "id", ""))
-                for idx, ep in enumerate(episode_list)
-            ]
-            play_urls.append("#".join(play_url))
-            show.append(current_source_name)
-
-            # 其余播放源 → 虚拟分集
-            for pl in player_list:
+            # 真实分集：清晰度排序后，逐源尝试匹配 episodeTotal；
+            # 第一源用真实分集，其余源虚拟分集
+            for pl in self._sorted_players(player_list, current_id):
                 pl_id = pl.get("id")
-                if pl_id == current_id:
+                if pl_id in done_ids:
                     continue
-                pl_name = self._safe_get(pl, "moviePlayerName", "未知源")
-                if pl_name in show:
-                    continue
-                ep_total = self._safe_get(pl, "episodeTotal",
-                                          len(episode_list))
-                if ep_total and int(ep_total) > 0:
-                    pu = [
-                        "第%d集$%d@%s@%s@virtual"
-                        % (ep, ep, pl_id, video_id)
-                        for ep in range(1, min(int(ep_total) + 1,
-                                               NORMAL_EP_MAX))
-                    ]
-                    if pu:
-                        play_urls.append("#".join(pu))
-                        show.append(pl_name)
+                if not play_urls:
+                    # 首个（最清晰/当前）源 → 真实分集
+                    pu = ["%s$%s@%s@%s@episode"
+                          % (self._sg(ep, "episode", "第%d集" % (i + 1)),
+                             video_id, pl_id, self._sg(ep, "id", ""))
+                          for i, ep in enumerate(episode_list)]
+                    done_ids.add(pl_id)
+                else:
+                    ep_total = self._to_int(
+                        self._sg(pl, "episodeTotal", len(episode_list)))
+                    if ep_total <= 0:
+                        continue
+                    pu = ["第%d集$%d@%s@%s@virtual"
+                          % (ep, ep, pl_id, video_id)
+                          for ep in range(1, min(ep_total + 1, NORMAL_EP_MAX))]
+                    done_ids.add(pl_id)
+                if pu:
+                    play_urls.append("#".join(pu))
+                    show.append(self._label_player(pl, used))
         else:
-            # 没有真实分集 → 虚拟分集（取第一个有效源）
-            for pl in player_list:
-                pl_id = pl.get("id")
-                episode_total = pl.get("episodeTotal")
-                pl_name = self._safe_get(pl, "moviePlayerName", "默认源")
-
-                if episode_total and int(episode_total) > 0:
-                    pu = [
-                        "第%d集$%d@%s@%s@virtual"
-                        % (ep, ep, pl_id, video_id)
-                        for ep in range(1, min(int(episode_total) + 1,
-                                               NORMAL_EP_MAX))
-                    ]
-                    if pu:
-                        play_urls.append("#".join(pu))
-                        show.append(pl_name)
-                    break
+            for pl in self._sorted_players(player_list, current_id):
+                ep_total = self._to_int(self._sg(pl, "episodeTotal", 0))
+                if ep_total <= 0:
+                    continue
+                pu = ["第%d集$%d@%s@%s@virtual" % (ep, ep, pl.get("id"),
+                                                video_id)
+                      for ep in range(1, min(ep_total + 1, NORMAL_EP_MAX))]
+                if pu:
+                    play_urls.append("#".join(pu))
+                    show.append(self._label_player(pl, used))
 
         return play_urls, show
 
+    # ---------- 播放 ----------
     def playerContent(self, flag, id, vipFlags):
-        """获取播放地址：id 格式 param@playerid@param2@param3
-        param3=virtual → 短剧虚拟分集(episodeIndex)；否则 episodeId"""
+        """id: param@playerid@param2@param3
+        virtual → episodeIndex；episode → episodeId（真机验证）"""
         try:
             parts = str(id).split("@")
             if len(parts) < 4:
-                self._log("player: 无效的播放ID格式: %s" % id)
+                self._log("player: 无效ID: %s" % id)
                 return self._empty_play()
 
-            param, playerid, param2, param3 = parts[0], parts[1], parts[2], parts[3]
+            param, playerid, param2, param3 = parts[:4]
 
             if param3 == "virtual":
-                payload = {
-                    "episodeIndex": str(max(0, int(param) - 1)),
-                    "id": int(param2),
-                    "playerId": playerid,
-                    "source": 0,
-                    "typeId": SHORT_TYPE_ID,
-                    "userId": self.userid,
-                }
+                payload = {"episodeIndex": str(max(0, self._to_int(param, 1)
+                                                   - 1)),
+                           "id": self._to_int(param2, 0),
+                           "playerId": playerid, "source": 0,
+                           "typeId": "M16", "userId": self.userid}
             else:
-                payload = {
-                    "episodeId": param2,
-                    "id": param,
-                    "playerId": playerid,
-                    "source": 0,
-                    "typeId": SHORT_TYPE_ID,
-                    "userId": self.userid,
-                }
+                payload = {"episodeId": param2, "id": param,
+                           "playerId": playerid, "source": 0,
+                           "typeId": "M16", "userId": self.userid}
 
-            result = self._safe_request(
-                "%s/api/v1/app/play/movieDetails" % self.host,
-                payload=payload, method="POST")
+            result = self._api("/api/v1/app/play/movieDetails",
+                               payload=payload)
             if not result:
                 return self._empty_play()
 
             data = result.get("data", {}) or {}
-            parse_url = data.get("url", "")
+            parse_url = self._sg(data, "url")
             playerid = data.get("playerId", playerid)
-
             if not parse_url:
-                self._log("player: 未获取到播放URL")
+                self._log("player: 无播放URL")
                 return self._empty_play()
 
-            # 二次解析真实直链
-            analysis = self._safe_request(
-                "%s/api/v1/app/play/analysisMovieUrl?playerUrl=%s&playerId=%s"
-                % (self.host, quote(str(parse_url), safe=""), playerid),
+            analysis = self._api(
+                "/api/v1/app/play/analysisMovieUrl?playerUrl=%s&playerId=%s"
+                % (quote(str(parse_url), safe=""), playerid),
                 method="GET")
             url = (analysis.get("data", "") if analysis else "") or ""
+            if isinstance(url, dict):
+                url = url.get("url", "") or ""
 
-            self._log("player: 解析成功 url=%s" % str(url)[:160])
-            return {
-                "jx": "0",
-                "parse": "0",
-                "url": url,
-                "header": {"User-Agent": UA_PLAY},
-            }
+            self._log("player: %s" % str(url)[:160])
+            return {"jx": "0", "parse": "0", "url": url,
+                    "header": {"User-Agent": UA_PLAY}}
         except Exception as e:
             self._log("playerContent FAIL: %s" % e)
             return self._empty_play()
@@ -718,7 +730,7 @@ class Spider(_BaseSpider):
     def _empty_play(self):
         return {"jx": "0", "parse": "0", "url": "", "header": {}}
 
-    # ---------- 框架预留接口 ----------
+    # ---------- 预留 ----------
     def isVideoFormat(self, url):
         return ".m3u8" in url or ".mp4" in url or url.startswith("http")
 
@@ -726,7 +738,7 @@ class Spider(_BaseSpider):
         return False
 
     def destroy(self):
-        self._log("destroy: 爬虫已销毁")
+        self._log("destroy")
         try:
             self._cache.clear()
         except Exception:
@@ -739,107 +751,81 @@ class Spider(_BaseSpider):
         return [200, "image/jpeg", b"", ""]
 
 
-# ---------- 独立运行自测 ----------
+# ---------- 独立自测 ----------
 if __name__ == "__main__":
-    print("=" * 60)
-    print("八戒影视爬虫 - 独立测试")
-    print("=" * 60)
+    print("=" * 66)
+    print("八戒影视爬虫 V3 - 真机校准测试")
+    print("=" * 66)
 
     sp = Spider()
 
-    # 1. 测试初始化
-    print("\n[测试1] 初始化...")
+    print("\n[1] 初始化...")
     try:
         sp.init()
-        print("✅ 初始化成功")
-        print("   host    = %s" % sp.host)
-        print("   userid  = %s" % sp.userid)
-        print("   token   = %s..." % (sp.headers.get("token") or "")[:24])
+        print("✅ host=%s userid=%s" % (sp.host, sp.userid))
     except Exception as e:
-        print("❌ 初始化失败: %s" % e)
+        print("❌ %s" % e)
         sys.exit(1)
 
-    # 2. 测试首页分类
-    print("\n[测试2] 获取首页分类...")
+    print("\n[2] 分类+筛选树...")
     try:
-        result = sp.homeContent(None)
-        classes = result.get("class", [])
-        print("✅ 获取到 %d 个分类" % len(classes))
-        if classes:
-            print("   前5个分类: %s"
-                  % [(c["type_name"], c["type_id"]) for c in classes[:5]])
+        hc = sp.homeContent(True)
+        classes = hc.get("class", [])
+        filters = hc.get("filters", {})
+        print("✅ %d 分类: %s"
+              % (len(classes), [(c["type_id"], c["type_name"])
+                                for c in classes]))
+        tid0 = classes[0]["type_id"] if classes else "M15"
+        for f in filters.get(tid0, []):
+            print("   %s(%s): %s..."
+                  % (f["name"], f["key"],
+                     [v["n"] for v in f["value"][:8]]))
     except Exception as e:
-        print("❌ 获取分类失败: %s" % e)
+        print("❌ %s" % e)
 
-    # 3. 测试推荐内容
-    print("\n[测试3] 获取推荐内容...")
+    print("\n[3] 筛选生效验证 (内地+古装+2025)...")
     try:
-        result = sp.homeVideoContent()
-        videos = result.get("list", [])
-        print("✅ 获取到 %d 个推荐视频" % len(videos))
-        if videos:
-            print("   首个视频: %s" % videos[0].get("vod_name", "N/A"))
+        r = sp.categoryContent("M15", "1", None,
+                               {"region": "内地", "classify": "古装",
+                                "year": "2025"})
+        for v in r.get("list", [])[:5]:
+            print("   %s (%s/%s/%s)"
+                  % (v["vod_name"], v["vod_year"], v["vod_area"],
+                     v["vod_remarks"]))
+        print("   pagecount=%s total=%s"
+              % (r.get("pagecount"), r.get("total")))
     except Exception as e:
-        print("❌ 获取推荐失败: %s" % e)
+        print("❌ %s" % e)
 
-    # 4. 测试分类内容
-    print("\n[测试4] 获取分类内容 (tid=1)...")
-    try:
-        result = sp.categoryContent("1", "1", None, None)
-        c_videos = result.get("list", [])
-        print("✅ 获取到 %d 个视频" % len(c_videos))
-        if c_videos:
-            sample = c_videos[0]
-            print("   示例: %s (%s)"
-                  % (sample.get("vod_name", "N/A"),
-                     sample.get("vod_year", "未知年份")))
-    except Exception as e:
-        print("❌ 获取分类内容失败: %s" % e)
-
-    # 5. 测试搜索
+    print("\n[4] 搜索'蒸蒸日上'...")
     videos = []
-    print("\n[测试5] 搜索 '电影'...")
     try:
-        result = sp.searchContent("电影", False, "1")
-        videos = result.get("list", [])
-        print("✅ 找到 %d 个结果" % len(videos))
-        if videos:
-            print("   首个结果: %s" % videos[0].get("vod_name", "N/A"))
+        videos = sp.searchContent("蒸蒸日上", False, "1").get("list", [])
+        print("✅ %d 条" % len(videos))
     except Exception as e:
-        print("❌ 搜索失败: %s" % e)
+        print("❌ %s" % e)
 
-    # 6. 测试详情（含简介前缀校验）
     if videos:
-        print("\n[测试6] 获取视频详情...")
+        print("\n[5] 详情（前缀/元信息/清晰度线路）...")
         try:
-            video_id = videos[0].get("vod_id")
-            if video_id:
-                result = sp.detailContent([video_id])
-                detail_list = result.get("list", [])
-                if detail_list:
-                    detail = detail_list[0]
-                    print("✅ 获取详情成功")
-                    print("   名称: %s" % detail.get("vod_name", "N/A"))
-                    print("   播放源: %s" % detail.get("vod_play_from", "N/A"))
-                    content = detail.get("vod_content", "")
-                    ok = content.startswith(INTRO_PREFIX)
-                    print("   简介前缀: %s"
-                          % ("✅ 已添加" if ok else "❌ 缺失"))
-                    print("   简介首行: %s"
-                          % content.split("\n")[1][:50] if "\n" in content
-                          else content[:50])
-                    play_urls = detail.get("vod_play_url", "").split("$$$")
-                    print("   播放列表数: %d" % len(play_urls))
-                    if play_urls:
-                        print("   第一个播放列表集数: %d"
-                              % len(play_urls[0].split("#")))
-                else:
-                    print("❌ 获取详情返回空数据")
-            else:
-                print("❌ 视频ID为空")
+            d = sp.detailContent([videos[0]["vod_id"]])["list"][0]
+            print("   名称: %s  评分: %s" % (d["vod_name"], d["vod_score"]))
+            print("   年份:%s 地区:%s 类型:%s"
+                  % (d["vod_year"], d["vod_area"], d["type_name"]))
+            print("   导演: %s" % d.get("vod_director"))
+            print("   演员: %s" % d.get("vod_actor"))
+            print("   备注: %s" % d.get("vod_remarks"))
+            print("   简介:")
+            for line in d["vod_content"].split("\n"):
+                print("     | %s" % line[:70])
+            print("   线路:")
+            urls = d["vod_play_url"].split("$$$")
+            for i, name in enumerate(d["vod_play_from"].split("$$$")):
+                print("     %d. %-24s %d集"
+                      % (i + 1, name, len(urls[i].split("#"))))
         except Exception as e:
-            print("❌ 获取详情失败: %s" % e)
+            print("❌ %s" % e)
 
-    print("\n" + "=" * 60)
-    print("所有测试完成！")
-    print("=" * 60)
+    print("\n" + "=" * 66)
+    print("测试完成")
+    print("=" * 66)
