@@ -529,6 +529,10 @@ class Spider(_BaseSpider):
         except Exception:
             self.extend = {}
         self._cache = {}
+        # 可选：外部解析接口（用于爱奇艺网页型片源）
+        # ext 配置示例: {"jxapi": "https://your.jx/api/?url="}
+        # 返回 JSON: {"code":200/1, "url": "直链m3u8/mp4"}
+        self.jxapi = str(self.extend.get("jxapi", "") or "").strip()
 
         # 1) host（支持 BAJIE_HOST 覆盖）
         cfg_host = os.environ.get("BAJIE_HOST", "").strip()
@@ -965,9 +969,20 @@ class Spider(_BaseSpider):
                 if url2 and self._is_media_url(url2):
                     url = url2
                 else:
+                    page = str(url)
+                    # ① 外部解析钩子（extend 配置 jxapi 时启用）
+                    if self.jxapi:
+                        jx_url = self._try_jx(page)
+                        if jx_url:
+                            self._log("player: jx解析成功 %s"
+                                      % str(jx_url)[:120])
+                            return {"jx": "0", "parse": "0",
+                                    "url": jx_url,
+                                    "header": {"User-Agent": UA_PLAY}}
+                    # ② 交给 TVBox 嗅探（需配置里有嗅探/WebView 能力）
                     self._log("player: 非媒体直链, 交给嗅探: %s"
-                              % str(url)[:120])
-                    return {"jx": "0", "parse": "1", "url": str(url),
+                              % page[:120])
+                    return {"jx": "0", "parse": "1", "url": page,
                             "header": {"User-Agent": UA_PLAY}}
 
             self._log("player: %s" % str(url)[:160])
@@ -976,6 +991,24 @@ class Spider(_BaseSpider):
         except Exception as e:
             self._log("playerContent FAIL: %s" % e)
             return self._empty_play()
+
+    def _try_jx(self, page: str) -> str:
+        """调用外部解析接口，成功返回媒体直链，失败返回空"""
+        try:
+            resp = self.fetch(self.jxapi + quote(page, safe=""),
+                              headers={"User-Agent": UA_PLAY}, timeout=12)
+            try:
+                j = resp.json()
+            except Exception:
+                return ""
+            url = (j.get("url") or j.get("data", {}).get("url")
+                   if isinstance(j.get("data"), dict) else j.get("url")) or ""
+            if isinstance(url, dict):
+                url = url.get("url", "")
+            url = str(url or "")
+            return url if self._is_media_url(url) else ""
+        except Exception:
+            return ""
 
     def _resolve_play_url(self, parse_url, playerid):
         """调用 analysisMovieUrl 解析真实直链"""
