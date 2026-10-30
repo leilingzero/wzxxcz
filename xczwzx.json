@@ -35485,6 +35485,18 @@
             "api": "./py/米动漫.py"
         },
         {
+            "key": "吉里动漫",
+            "name": "🤣吉里动漫",
+            "type": 3,
+            "api": "csp_AnimeGiri"
+        },
+        {
+            "key": "花子动漫",
+            "name": "🌸花子动漫",
+            "type": 3,
+            "api": "csp_AnimeHuazi"
+        },
+        {
             "key": "红果短剧",
             "name": "🍎红果短剧",
             "type": 3,
