@@ -1,11 +1,10 @@
 # coding=utf-8
 """
-66大片网 www.66dpw.vip | TVBox Python 爬虫 (V1.0)
+66大片网 www.66dpw.vip | TVBox Python 爬虫 
 关键:
   - 苹果CMS mxpro 模板解析
   - 破解播放页 player_aaaa 的 encrypt=2 地址: base64 -> URL decode
   - 极速线路直出 m3u8 (parse=0), 哔哩哔哩等外链交嗅探 (parse=1)
-  - 简介添加指定前缀
   - 搜索接口带验证码检测 (返回空并提示)
 """
 import re
@@ -164,10 +163,16 @@ _RE_INTRO = re.compile(
 _RE_META_DESC = re.compile(
     r'<meta[^>]*name=["\']description["\'][^>]*content=["\']([^"\']*)["\']',
     re.I)
-# module-info-item 块: <span class="module-info-item-title">导演：</span>...
-_RE_INFO_BLOCK = re.compile(
-    r'<span\s+class="module-info-item-title">([^：<]*)：?</span>\s*'
-    r'<div class="module-info-item-content">([\s\S]*?)</div>', re.I)
+# 元信息: 每个 module-info-item 块 (内容可能是 div 也可能是 p)
+_RE_INFO_ITEM = re.compile(
+    r'<div class="module-info-item"[^>]*>\s*'
+    r'<span\s+class="module-info-item-title">\s*([^<]*?)\s*</span>\s*'
+    r'<(?:div|p)[^>]*class="module-info-item-content"[^>]*>([\s\S]*?)</(?:div|p)>',
+    re.I)
+# 头部标签区: 年份 / 地区 / 剧情标签 (title 属性或链接文本)
+_RE_TAG_LINK = re.compile(
+    r'<div class="module-info-tag-link">([\s\S]*?)</div>', re.I)
+_RE_A_TEXT = re.compile(r'<a[^>]*?title="([^"]*)"[^>]*>([^<]*)</a>', re.I)
 
 # 播放页 player_aaaa
 _RE_PLAYER = re.compile(r'player_aaaa\s*=\s*(\{[\s\S]*?\})\s*[;<]', re.I)
@@ -501,22 +506,69 @@ class Spider(Spider):
         else:
             content = INTRO_PREFIX
 
-        # 元信息 (导演/主演等)
+        # 元信息 (导演/主演/更新/备注/评分)
         director = ""
         actor = ""
         year = ""
+        area = ""
+        remarks = ""
+        updated = ""
+        score = ""
         try:
-            for k, v in _RE_INFO_BLOCK.findall(html):
-                val = self._clean(v).strip("/ ").strip()
-                k = self._clean(k)
-                if k == "导演" and val:
-                    director = re.sub(r"\s*/\s*", ", ", val)
-                elif k == "主演" and val:
-                    actor = re.sub(r"\s*/\s*", ", ", val)
-                elif k in ("年份", "上映") and val:
+            for k, v in _RE_INFO_ITEM.findall(html):
+                key = self._clean(k).rstrip("：:").strip()
+                raw = v
+                # 用 / 分隔的链接列表 -> 逗号连接
+                names = [self._clean(t).strip()
+                         for _, t in _RE_A_TEXT.findall(raw)]
+                names = [n for n in names if n]
+                val = ", ".join(names) if names else self._clean(raw)
+                val = re.sub(r"\s*/\s*", ", ", val).strip(", /")
+                val = re.sub(r"\s+", " ", val).strip()
+                if not val:
+                    continue
+                if key == "导演":
+                    director = val
+                elif key == "主演":
+                    actor = val
+                elif key == "年份":
                     year = val
+                elif key == "地区":
+                    area = val
+                elif key == "备注":
+                    remarks = val
+                elif key == "更新":
+                    updated = val
+                elif key in ("评分", "豆瓣"):
+                    m = re.search(r"([\d.]+)\s*分", val)
+                    if m:
+                        score = m.group(1)
         except Exception as e:
             self.log("  元信息解析失败: %s" % e)
+
+        # 头部标签区: 第1块=年份, 第2块=地区, 其余=剧情标签
+        try:
+            tags = _RE_TAG_LINK.findall(html)
+            parsed = []
+            for tb in tags:
+                items = [self._clean(t or a)
+                         for t, a in _RE_A_TEXT.findall(tb)]
+                items = [i for i in items if i and i != "/"]
+                parsed.append(items)
+            if parsed:
+                if not year and parsed[0]:
+                    first = parsed[0][0]
+                    if re.fullmatch(r"\d{4}", first):
+                        year = first
+                if len(parsed) > 1 and not area and parsed[1]:
+                    second = parsed[1][0]
+                    if not re.fullmatch(r"\d{4}", second):
+                        area = second
+        except Exception as e:
+            self.log("  标签区解析失败: %s" % e)
+
+        self.log("  元信息: 年=%s 地区=%s 导=%s 演=%s 备注=%s"
+                 % (year, area, director[:12], actor[:12], remarks))
 
         # ===== 线路与剧集 =====
         # 关键: 面板(panel)顺序 == 标签(data-dropdown-value)顺序,
@@ -593,10 +645,8 @@ class Spider(Spider):
             play_url.append("#".join(
                 "%s$%s" % (n, self._fix_url(h)) for n, h in eps))
 
-        remarks = []
-        if year:
-            remarks.append(year)
-        remarks.append("%d条线路" % len(groups))
+        # 展示备注: 优先站点真实备注(如"22集全"), 其次线路数
+        note = remarks or ("%d条线路" % len(groups))
 
         return {"list": [{
             "vod_id": vod_id,
@@ -606,12 +656,41 @@ class Spider(Spider):
             "vod_actor": actor,
             "vod_director": director,
             "vod_year": year,
-            "vod_remarks": " · ".join(remarks),
+            "vod_area": area,
+            "vod_score": score,
+            "vod_remarks": note,
+            "vod_pubdate": updated,
             "vod_play_from": "$$$".join(play_from),
             "vod_play_url":  "$$$".join(play_url),
         }]}
 
     # -------- 播放 --------
+    def _absolutize_key(self, url):
+        """把 m3u8 中的 AES-128 相对 key 地址改写为绝对地址。
+        站点流形如: #EXT-X-KEY:METHOD=AES-128,URI="enc.key"
+        部分播放器无法按 m3u8 所在目录解密, 会直接黑屏 -> 走本地代理输出改写后的 playlist。
+        """
+        if not url or ".m3u8" not in url.lower():
+            return url
+        try:
+            rsp = self.fetch(url, headers={
+                "User-Agent": UA,
+                "Referer": self.site_url + "/",
+            }, timeout=15)
+            text = rsp.text if hasattr(rsp, "text") else ""
+        except Exception as e:
+            self.log("  m3u8 预取失败: %s" % e)
+            return url
+        if not text or "#EXTM3U" not in text:
+            return url
+        # 相对 key 无需改写, 直接返回原地址(避免多余代理)
+        m = re.search(r'#EXT-X-KEY:([^\n]*?)URI="([^"]+)"', text)
+        if not m or m.group(2).startswith("http"):
+            return url
+        self.log("  ⚠️ 检测到相对 key('%s'), 走代理改写" % m.group(2))
+        # TVBox 会把 {host}/proxy?url=xxx 路由到本爬虫的 localProxy
+        return "{host}" + "/proxy?url=" + urllib.parse.quote(url, safe="")
+
     # -------- 自动换源 --------
     def _vod_id(self, play_page):
         m = re.search(r"/vodplay/(\d+)-", play_page)
@@ -696,6 +775,7 @@ class Spider(Spider):
                 if vod_id and ep_idx:
                     alt = self._find_direct_line(vod_id, ep_idx)
                     if alt:
+                        alt = self._absolutize_key(alt)
                         self.log("  ★ 自动换源成功: %s" % alt[:120])
                         res = {
                             "parse": 0, "playUrl": "", "url": alt,
@@ -712,6 +792,7 @@ class Spider(Spider):
                 return res
 
             # 直链 m3u8/mp4
+            real_url = self._absolutize_key(real_url)
             res = {
                 "parse": 0,
                 "playUrl": "",
@@ -787,11 +868,42 @@ class Spider(Spider):
                 return [200, "image/jpeg", b"", ""]
             url = urllib.parse.unquote(url) if "%" in url else url
             url = self._fix_url(url)
+
             rsp = self.fetch(url, headers={
                 "User-Agent": UA,
                 "Referer": self.site_url + "/",
             }, timeout=15)
             content = rsp.content
+
+            # m3u8: 把相对 key / 分片地址改写为绝对地址后返回
+            if ".m3u8" in url.lower():
+                text = ""
+                try:
+                    text = rsp.text if hasattr(rsp, "text") else \
+                        content.decode("utf-8", "ignore")
+                except Exception:
+                    text = content.decode("utf-8", "ignore")
+                if "#EXTM3U" in text:
+                    base = url.rsplit("/", 1)[0] + "/"
+                    text = re.sub(
+                        r'URI="([^"]+)"',
+                        lambda m: 'URI="%s"' % (
+                            m.group(1) if m.group(1).startswith("http")
+                            else urllib.parse.urljoin(base, m.group(1))),
+                        text)
+                    # 相对分片行也补全
+                    out = []
+                    for line in text.splitlines():
+                        s = line.strip()
+                        if s and not s.startswith("#") \
+                                and not s.startswith("http"):
+                            line = urllib.parse.urljoin(base, s)
+                        out.append(line)
+                    return [200, "application/vnd.apple.mpegurl",
+                            "\n".join(out), {"User-Agent": UA}]
+                return [200, "application/vnd.apple.mpegurl", text,
+                        {"User-Agent": UA}]
+
             ctype = rsp.headers.get("Content-Type", "image/jpeg")
             if not ctype.startswith("image/"):
                 ctype = "image/jpeg"
