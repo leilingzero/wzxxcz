@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 八戒影视 Spider（hipy / CatVod 类爬虫框架适配）V3 — 真机字段校准版
-已用真实接口 (82.156.118.137:88      http://osstexll.oss-rg-china-mainland.aliyuncs.com/domainPath.json) 逐字段验证:
+已用真实接口 (82.156.118.137:88) 逐字段验证:
   - screenType: 树形结构，一级分类(M15电视剧/M16电影/M14短剧/M17动漫/M18综艺/M396动画片)
     children 为筛选组(地区/类型/年份)，叶子 name 即筛选值(如"内地","古装","2025")
   - screenMovie condition: {classify:类型中文名, region:地区中文名,
@@ -543,33 +543,14 @@ class Spider(_BaseSpider):
             show = ["默认源"]
             play_urls = ["第1集$1@0@%s@virtual" % video_id]
 
-        # ===== 简介: 前缀 + 副标题/元信息 + 正文 =====
+        # ===== 简介: 仅前缀 + 正文 =====
+        # 主演/导演/类型/年份/地区/评分均已写入 vod_actor / vod_director /
+        # type_name / vod_year / vod_area / vod_score 独立字段，
+        # 详情页头部自行展示，不再重复塞进简介
         intro = str(self._sg(desc_data, "introduce")
                     or self._sg(data, "desc") or "").strip()
 
-        meta = []
-        alias = str(self._sg(desc_data, "subName")
-                    or self._sg(desc_data, "alias") or "").strip()
-        if alias:
-            meta.append("又名: %s" % alias)
-        bits = []
-        if self._sg(desc_data, "director"):
-            bits.append("导演: %s" % desc_data["director"])
-        if self._sg(desc_data, "star"):
-            bits.append("主演: %s" % desc_data["star"])
-        if self._sg(desc_data, "classify"):
-            bits.append("类型: %s" % desc_data["classify"])
-        if bits:
-            meta.append(" / ".join(bits))
-        watch = self._sg(desc_data, "watch")
-        if watch:
-            meta.append("热度: %s" % watch)
-
-        parts = [INTRO_PREFIX]
-        parts.extend(meta)
-        if intro:
-            parts.append(intro)
-        content = "\n".join(parts)
+        content = (INTRO_PREFIX + "\n" + intro) if intro else INTRO_PREFIX
 
         # 备注: 最高清晰度标签 + 线路数（从真实 playerList 判断，不受改名影响）
         best_tag = ""
