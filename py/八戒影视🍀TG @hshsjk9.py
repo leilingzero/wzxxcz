@@ -84,6 +84,9 @@ INTRO_PREFIX = "🍊小橙子为您介绍剧情👉请不要相信视频中的�
 
 DEVICE_ID = "2d590b9842d064a1"
 
+# 源站筛选树里的脏节点（命名不当/无内容），直接剔除不展示
+FILTER_LEAF_BLOCKLIST = {"小日本"}
+
 # 筛选组名 → screenMovie condition 参数名（真机验证）
 FILTER_GROUP_KEY = {"地区": "region", "类型": "classify", "年份": "year"}
 
@@ -494,7 +497,9 @@ class Spider(_BaseSpider):
                 values = [{"n": "全部", "v": ""}] + [
                     {"n": str(self._sg(leaf, "name")),
                      "v": str(self._sg(leaf, "name"))}
-                    for leaf in leaves if self._sg(leaf, "name")
+                    for leaf in leaves
+                    if self._sg(leaf, "name")
+                    and str(self._sg(leaf, "name")) not in FILTER_LEAF_BLOCKLIST
                 ]
                 flist.append({"key": gkey, "name": gname, "value": values})
 
