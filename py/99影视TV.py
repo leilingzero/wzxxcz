@@ -1,6 +1,6 @@
 # coding=utf-8
 """
-99影视TV 99itv.cc | TVBox Python 爬虫 (V1.0)
+99影视TV 99itv.cc | TVBox Python 爬虫 
 站点结构:
   - 首页        /                                   (多板块卡片)
   - 分类首页    /type/{movie|drama|variety|anime}.html
@@ -17,7 +17,11 @@ import re
 import sys
 import json
 import time
+import ssl
+import threading
+import collections
 import urllib.parse
+import urllib.request
 
 sys.path.append('..')
 
@@ -145,6 +149,7 @@ _TRADITIONAL = (
 )
 
 _TO_TRAD = dict(zip(_SIMPLIFIED, _TRADITIONAL))
+_TO_SIMP = dict(zip(_TRADITIONAL, _SIMPLIFIED))
 
 
 def s2t(text):
@@ -152,6 +157,17 @@ def s2t(text):
     if not text:
         return ""
     return "".join(_TO_TRAD.get(c, c) for c in text)
+
+
+def _s2t(text):
+    return s2t(text)
+
+
+def _t2s(text):
+    """繁体转简体（搜索时站内是繁体、suggest 给的是简体，需要双向归一）"""
+    if not text:
+        return ""
+    return "".join(_TO_SIMP.get(c, c) for c in text)
 
 
 
@@ -297,7 +313,170 @@ _RE_PAGE_NUM = re.compile(
 # 路径解析: /show/{type}-{area}--{page}-{sort}--{year}.html
 _RE_SHOW_PATH = re.compile(r'/show/([^/]*?)\.html$', re.I)
 
+# 播放页地址：/userpy/{slug}-{线路序号}-{集数}.html
+_RE_PLAY_HREF = re.compile(r'/userpy/([^-/]+)-(\d+)-(\d+)\.html', re.I)
 
+# m3u8 变体流（多码率）
+_RE_VARIANT = re.compile(r'#EXT-X-STREAM-INF[^\n]*\n([^\n#]+)', re.I)
+
+# 切片序号：0000123.ts / xxx-12.ts（用于推算后续切片，实现滚动预取）
+
+
+# ======================================================================
+# 播放加速：线路测速 + 分片级并发代理
+# 站点「無水印」源单连接限速约 100~160 KB/s，1080P 播放必然卡顿；
+# 实测同源并发 8 路可达 1100+ KB/s（约 7 倍），因此：
+#   1) 详情页对每条线路取首集 m3u8 测速并缓存，播放时按速度选源
+#   2) localProxy 对 m3u8 统一改写，切片走本地并发预取，匀速吐给播放器
+# ======================================================================
+_SEG_SEM = None
+_SEG_MEM = {}          # url -> (ts, bytes)
+_SEG_MEM_MAX = 240     # 内存缓存切片数（约 100~180MB，够缓冲即可，不必囤太多）
+_WINDOW = 30           # 预取窗口：30 片 ≈ 90s 素材
+_LOW_WATER = 14        # 连续缓冲低于 14 片（约 42s）就补货：稳态覆盖更厚
+_BATCH = 10            # 每次补货片数
+_SPEED_MEM = {}        # 线路名 -> 实测速度(KB/s)，跨片复用，避免重复测速
+# 并发数：实测该 CDN 对单连接限死 ~150KB/s，16 路可达 1400~1900KB/s。
+# 但因为采用"水位补货"，稳态只用 8~16 路，且绝不与播放头抢带宽。
+_PREFETCH = 16
+_PREFETCH_BURST = 16   # 起播突发并发，与稳态一致
+_SSL_CTX = None
+
+
+def _ssl_ctx():
+    """部分 CDN 用自签/非常见证书链，TLS 校验失败时降级"""
+    global _SSL_CTX
+    if _SSL_CTX is None:
+        try:
+            _SSL_CTX = ssl.create_default_context()
+            _SSL_CTX.check_hostname = False
+            _SSL_CTX.verify_mode = ssl.CERT_NONE
+        except Exception:
+            _SSL_CTX = None
+    return _SSL_CTX
+
+
+def _http_get(url, timeout=12, referer=""):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UA,
+        "Referer": referer or HOST + "/",
+        "Accept": "*/*",
+    })
+    return urllib.request.urlopen(req, timeout=timeout,
+                                  context=_ssl_ctx()).read()
+
+
+def _abs(baseurl, seg):
+    if not seg:
+        return seg
+    if seg.startswith("http://") or seg.startswith("https://"):
+        return seg
+    if seg.startswith("//"):
+        return "https:" + seg
+    if seg.startswith("/"):
+        p = urllib.parse.urlparse(baseurl)
+        return "%s://%s%s" % (p.scheme, p.netloc, seg)
+    return baseurl.rsplit("/", 1)[0] + "/" + seg
+
+
+def _speed_probe(m3u8_url, sample=3, timeout=8):
+    """返回 (速度KB/s, 是否有效)；只拉前几个切片做样本，开销很小"""
+    try:
+        t0 = time.time()
+        body = _http_get(m3u8_url, timeout=timeout)
+        if not body:
+            return 0.0, False
+        txt = body.decode("utf-8", "ignore")
+        # 变体流先下钻一层
+        if "#EXT-X-STREAM-INF" in txt:
+            mv = _RE_VARIANT.search(txt)
+            if mv:
+                sub = _abs(m3u8_url, mv.group(1).strip())
+                m3u8_url = sub
+                body = _http_get(sub, timeout=timeout)
+                txt = body.decode("utf-8", "ignore")
+        segs = [l.strip() for l in txt.splitlines()
+                if l.strip() and not l.startswith("#")]
+        if not segs:
+            return 0.0, False
+        # 首个切片必测；耗时过长直接判慢
+        total = 0
+        for s in segs[:sample]:
+            u = _abs(m3u8_url, s)
+            total += len(_http_get(u, timeout=timeout))
+        dt = max(time.time() - t0, 0.001)
+        return (total / 1024.0) / dt, True
+    except Exception:
+        return 0.0, False
+
+
+_INFLIGHT = {}
+_INFLIGHT_LOCK = threading.Lock()
+
+
+def _seg_fetch(url, timeout=15):
+    """带内存缓存 + 同 URL 去重的下载
+
+    去重很关键：预热线程与播放器请求可能同时要同一个 m3u8，
+    不去重就会重复下两次、反而更慢。
+    """
+    now = time.time()
+    hit = _SEG_MEM.get(url)
+    if hit and now - hit[0] < 120:
+        return hit[1]
+
+    with _INFLIGHT_LOCK:
+        ev = _INFLIGHT.get(url)
+        if ev is None:
+            ev = [threading.Event(), None]
+            _INFLIGHT[url] = ev
+            owner = True
+        else:
+            owner = False
+
+    if not owner:
+        ev[0].wait(timeout)
+        if ev[1] is not None:
+            return ev[1]
+
+    try:
+        data = _http_get(url, timeout=timeout)
+        if len(_SEG_MEM) > _SEG_MEM_MAX:
+            for k in sorted(_SEG_MEM,
+                            key=lambda x: _SEG_MEM[x][0])[:len(_SEG_MEM) // 2]:
+                _SEG_MEM.pop(k, None)
+        _SEG_MEM[url] = (time.time(), data)
+        ev[1] = data
+        return data
+    finally:
+        if owner:
+            ev[0].set()
+            with _INFLIGHT_LOCK:
+                _INFLIGHT.pop(url, None)
+
+
+def _concurrent_download(urls, workers=_PREFETCH):
+    """并发拉取，返回 {url: bytes}，失败的 key 不出现
+
+    用 as_completed 而不是按顺序收：谁先回来先入库，任何一路慢都不会
+    拖住后面的切片（对"下一片必须最快"这点至关重要）。
+    """
+    out = {}
+    if not urls:
+        return out
+    try:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_seg_fetch, u): u for u in urls}
+            for f in as_completed(futs):
+                u = futs[f]
+                try:
+                    out[u] = f.result()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return out
 
 
 class Spider(Spider):
@@ -327,6 +506,26 @@ class Spider(Spider):
         self._idx_cache = {}
         self._native_bad = False
         self._warmed = False
+
+        # 本地代理基址（TVBox 会注入；取不到就退回直链，不会影响播放）
+        self._seg_seq = {}
+        self._seg_index = {}      # 切片url -> (播放列表key, 下标)
+        self._playlist = {}       # 播放列表key -> [切片url...]（真实顺序）
+        self._fill_state = {}
+        self._m3u8_cache = {}
+        self._prewarm_evt = {}    # m3u8 -> Event，预热完成信号
+        self._variant_of = {}
+        self._sid_name = {}
+        self._cur_line = ""
+        self._proxy_base = ""
+        try:
+            base = self.getProxyUrl() or ""
+            self._proxy_base = base
+            if base:
+                self.log("proxy base: %s" % base)
+        except Exception:
+            self._proxy_base = ""
+
         self.log("init: site=%s" % self.site_url)
 
     # ------------------------------------------------------------------
@@ -650,7 +849,12 @@ class Spider(Spider):
         return videos, self._page_count(html, page)
 
     def _search_suggest(self, kw, page, limit=30):
-        """站内建议接口，返回 (videos, pagecount, total)"""
+        """站内建议接口，返回 (videos, pagecount, total)
+
+        实测要点：
+          - limit 参数真的生效，limit=100 可一次拿回全部命中（无需翻页）；
+          - 接口**不返回 type_id**，所以详情页短码只能靠数据接口按分区定位。
+        """
         api = "%s/index.php/ajax/suggest?mid=1&wd=%s&limit=%d" % (
             self.site_url, urllib.parse.quote(kw), limit)
         if page > 1:
@@ -670,7 +874,7 @@ class Spider(Spider):
             pic = it.get("pic") or ""
             en = it.get("en") or ""
             videos.append({
-                # sid: vod_id@拼音@片名 —— 详情时按片名解析真实详情页
+                # sid: vod_id@拼音@片名 —— 详情时到数据接口查真实短码
                 "vod_id": "sid:%s@%s@%s" % (vid, en, name),
                 "vod_name": name,
                 "vod_pic": self._fix_url(pic) or self.default_pic,
@@ -731,41 +935,185 @@ class Spider(Spider):
     # 因此按「片名」在站内列表页建立索引后匹配，索引带缓存。
     # ------------------------------------------------------------------
     def _resolve_sid(self, vod_id, name=""):
-        """把 sid:{id}@{en}@{name} 解析成 /detail/xxx.html"""
+        """把 sid:{id}@{en}@{name} 解析成 /detail/xxx.html
+
+        关键点：站点的详情页 slug 是随机短码（如 /detail/ufk55F.html），
+        与 vod_id **没有换算关系**。所以唯一可靠的途径是查站点的
+        数据接口 /index.php/ajax/data，它每条都带 detail_link。
+        """
         raw = str(vod_id or "").strip()
+        vid = ""
 
         if raw.startswith("sid:"):
             raw = raw[4:]
             parts = raw.split("@")
-            raw = parts[0].strip()
+            vid = parts[0].strip()
             if len(parts) >= 3:
                 name = parts[-1].strip()
             elif len(parts) == 2 and not name:
                 name = parts[1].strip()
+            raw = vid
 
-        raw = raw.strip()
         if not raw:
             return ""
 
         # 已是详情路径 / 完整 URL
-        if raw.startswith("/detail/") or raw.startswith("http"):
+        if raw.startswith("http"):
             return self._fix_url(raw)
         if raw.startswith("/"):
             return self._fix_url(raw)
 
-        # suggest id：按片名查索引
         key = "sid:%s" % raw
         if key in self._idx_cache:
             return self._idx_cache[key]
 
-        if name:
-            hit = self._lookup_by_name(name)
-            if hit:
-                self._idx_cache[key] = hit
-                return hit
+        # 1) 按 id / 片名定位真实详情短码（最可靠）
+        link = self._detail_link_by_id(raw, name)
+        if link:
+            self._idx_cache[key] = link
+            return link
 
-        # 兜底：当作 slug 直接试
-        return "%s/detail/%s.html" % (self.site_url, raw)
+        # 2) 仍未命中：不做"直接拼 id"的假猜测（站点短码是随机串，
+        #    拼出来必然 404）。name 已在第 1 步里参与定位，这里直接收尾。
+        self.log("  详情短码未定位: id=%s name=%s" % (raw, name))
+        return ""
+
+    def _detail_link_by_id(self, vid, name=""):
+        """按 vod_id / 片名定位详情页（短码随机，只能靠列表页反查）
+
+        站点限制（都实测过）：
+          - 详情短码是随机串（/detail/ufk55F.html），与 vod_id 无换算关系；
+          - 搜索页 /search* 被 Cloudflare WAF 直接 403；
+          - 数据接口 /index.php/ajax/data 的 ids/limit/page 参数基本失效
+            （page>=50 后永远返回首页内容，ids 被忽略）。
+        因此唯一稳的路是：在分类列表页里按片名找。用年份把总页数从
+        上千页压到几十页，再并行扫，通常 1~3s 内能定位。
+        """
+        try:
+            vid = int(vid)
+        except Exception:
+            vid = 0
+
+        key = "dl:%s:%s" % (vid, name)
+        cache = self._idx_cache
+        if key in cache:
+            return cache[key]
+
+        # 0) 数据接口最新 10 条里常能撞上（新片多），几乎零成本
+        try:
+            d = json.loads(_http_get(
+                "%s/index.php/ajax/data?mid=1&ids=%d" % (self.site_url, vid),
+                timeout=12).decode("utf-8", "ignore"))
+            for it in (d.get("list") or []):
+                if vid and int(it.get("vod_id") or 0) == vid and it.get("detail_link"):
+                    u = self._fix_url(it["detail_link"])
+                    cache[key] = u
+                    return u
+        except Exception:
+            pass
+
+        if not name:
+            return ""
+
+        # 1) 分类列表页按片名扫（年份分片，并行）
+        hit = self._scan_by_name(name)
+        if hit:
+            cache[key] = hit
+            return hit
+        return ""
+
+    def _scan_by_name(self, name):
+        """在分类列表页里按片名匹配（简繁双向归一）
+
+        现实约束（实测）：
+          - suggest 的数据源与前台列表页并不完全一致，少量片
+            （如"奇幻西游：新世界" id=100027）在列表页里根本不存在；
+          - 列表页每页 40 条、每类上千页，全量扫不现实。
+        因此策略是"有界 + 快返回"：
+          1) 先查已建好的名字索引（首页/今日更新/各类前 8 页）；
+          2) 再并行扫各类前若干页（新片都在前面）；
+          3) 一旦命中立即返回，并把结果长期缓存；
+          4) 整体最多耗 _SCAN_BUDGET 秒，超时就放弃，绝不拖住详情页。
+        """
+        name = self._clean(name)
+        if not name:
+            return ""
+        ck = "nm:%s" % name
+        if ck in self._idx_cache:
+            return self._idx_cache[ck]
+
+        want = set()
+        for cand in (name, _t2s(name), s2t(name)):
+            c = self._clean(cand)
+            if c:
+                want.add(c)
+
+        def same(a):
+            a = self._clean(a or "")
+            return bool(a) and (a in want or _t2s(a) in want or s2t(a) in want)
+
+        # 1) 全局名字索引
+        idx = self._get_name_index()
+        for k, v in list(idx.items()):
+            if isinstance(k, str) and k.startswith("name:") and same(k[5:]):
+                self._idx_cache[ck] = v
+                return v
+
+        types = ("movie", "drama", "variety", "anime")
+        years = [""] + [str(y) for y in range(2026, 2000, -1)]
+
+        def probe(args):
+            c, yr, p = args
+            try:
+                u = self._build_show_url(c, {"year": yr} if yr else {}, p)
+                for v in self._parse_cards(self._fetch(u, timeout=8)):
+                    if same(v.get("vod_name")):
+                        return self._fix_url(v["vod_id"])
+            except Exception:
+                pass
+            return ""
+
+        # 先扫"无年份 + 今年"的前 5 页（覆盖绝大多数影片，通常 <2s 命中）
+        first = [(c, y, p) for y in years[:2] for c in types for p in range(1, 6)]
+        hit = self._run_probes(first, probe, budget=3.0)
+        if hit:
+            self._idx_cache[ck] = hit
+            return hit
+
+        # 再往深处扫一轮（有界），仍不中就直接放弃，绝不让用户干等
+        batch = [(c, "", p) for c in types for p in range(6, 13)]
+        hit = self._run_probes(batch, probe, budget=3.0)
+        if hit:
+            self._idx_cache[ck] = hit
+            return hit
+        return ""
+
+    def _run_probes(self, tasks, probe, budget=5.0):
+        """并行探针，命中即返回；整体有硬性时间预算"""
+        try:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            ex = ThreadPoolExecutor(max_workers=16)
+            futs = [ex.submit(probe, t) for t in tasks]
+            deadline = time.time() + budget
+            try:
+                for f in as_completed(futs, timeout=budget):
+                    try:
+                        r = f.result()
+                    except Exception:
+                        r = ""
+                    if r:
+                        for g in futs:
+                            g.cancel()
+                        return r
+                    if time.time() > deadline:
+                        break
+            except Exception:
+                pass
+            finally:
+                ex.shutdown(wait=False)
+        except Exception:
+            pass
+        return ""
 
     def _lookup_by_name(self, name):
         """按片名在列表页里找详情页 slug"""
@@ -946,6 +1294,10 @@ class Spider(Spider):
             if sid not in groups:
                 groups[sid] = []
                 order.append(sid)
+                # 记录站内序号 -> 线路名（线路名按出现顺序对应 tabs）
+                _i = len(order) - 1
+                if _i < len(tabs):
+                    self._sid_name[sid] = tabs[_i]
             groups[sid].append((self._clean(ep_name) or "正片",
                                 self._fix_url(href)))
 
@@ -959,6 +1311,19 @@ class Spider(Spider):
             play_from.append(alias)
             play_url.append("#".join("%s$%s" % (n, h)
                                      for n, h in groups[sid]))
+
+        # ---- 线路测速：把快的源排到前面，并给线路名加上速度标注 ----
+        # 默认播放器取第一条线路，因此顺序 + 命名直接决定"点开能不能流畅播"
+        try:
+            ranked = self._rank_lines(order, groups, tabs)
+            if ranked:
+                play_from = [x[1] for x in ranked]
+                play_url = ["#".join("%s$%s" % (n, h) for n, h in x[2])
+                            for x in ranked]
+                self.log("  测速排序: %s" % [
+                    "%s(%dKB/s)" % (x[1], int(x[3])) for x in ranked])
+        except Exception as e:
+            self.log("  测速失败(忽略): %s" % e)
 
         result = {
             "vod_id": vod_id,
@@ -982,6 +1347,127 @@ class Spider(Spider):
     # ------------------------------------------------------------------
     # 播放
     # ------------------------------------------------------------------
+    def _rank_lines(self, order, groups, tabs):
+        """按"历史测速评分"给线路排序，让快源排在前面
+
+        不在详情页里现场测速：那样每次打开详情都要多花 5~8 秒，
+        而且会把带宽占满、拖慢紧接着的起播。
+        改为：播放时顺手记录每条线路的实测速度（_SPEED_MEM，进程内共享），
+        之后打开别的片时就能直接用历史评分排序，零额外开销。
+        """
+        try:
+            scored = []
+            for i, sid in enumerate(order):
+                name = tabs[i] if i < len(tabs) else ("线路%d" % (i + 1))
+                host = ""
+                try:
+                    host = urllib.parse.urlparse(groups[sid][0][1]).netloc
+                except Exception:
+                    pass
+                sp = _SPEED_MEM.get(name, 0.0)
+                scored.append((i, sid, name, groups[sid], sp, host))
+            # 有评分的按速度降序在前；没评分的保持原顺序在后
+            known = sorted([x for x in scored if x[4] > 0], key=lambda x: -x[4])
+            unknown = [x for x in scored if x[4] <= 0]
+            out = []
+            for x in known + unknown:
+                tag = x[2]
+                if x[4] > 0:
+                    tag = "%s·%dKB/s" % (x[2], int(x[4]))
+                out.append((x[1], tag, x[3], x[4]))
+            return out
+        except Exception:
+            return None
+
+    def _line_name(self, play_page):
+        """从播放页地址推线路名：/userpy/{slug}-{线路序号}-{集数}.html
+
+        线路序号是 1 基的站内编号（7 条线时顺序并不等于界面顺序），
+        详情页解析时已把"序号 -> 线路名"存进 _sid_name，这里直接查。
+        """
+        m = _RE_PLAY_HREF.search(play_page or "")
+        if not m:
+            return ""
+        return self._sid_name.get(m.group(2), "")
+
+    def _prewarm_m3u8(self, m3u8, line=""):
+        """后台预热：下钻变体流 + 预建切片映射 + 缓存改写结果 + 记录线路速度
+
+        播放器拿到代理地址后会立刻来取 m3u8。提前算好，首帧就只是一次
+        内存读取，而不是"主列表 -> 变体列表"两层串行握手。
+        """
+        try:
+            if not m3u8 or ".m3u8" not in m3u8.lower():
+                return
+            if m3u8 in self._m3u8_cache:
+                return
+
+            ev = threading.Event()
+            self._prewarm_evt[m3u8] = ev
+            t0 = time.time()
+            raw = _seg_fetch(m3u8, timeout=12)
+            txt = raw.decode("utf-8", "ignore")
+            real = m3u8
+            if "#EXT-X-STREAM-INF" in txt:
+                mv = _RE_VARIANT.search(txt)
+                if mv:
+                    sub = _abs(m3u8, mv.group(1).strip())
+                    self._variant_of[m3u8] = sub   # 先登记，让播放器能直接下钻
+                    txt = _seg_fetch(sub, timeout=12).decode("utf-8", "ignore")
+                    real = sub
+
+            base = self._proxy_base or ""
+            out = []
+            segs = []
+            for raw_line in txt.splitlines():
+                t = raw_line.strip()
+                if not t:
+                    continue
+                if t.startswith("#"):
+                    out.append(t)
+                    continue
+                full = _abs(real, t)
+                segs.append(full)
+                if base:
+                    out.append("%s&url=%s" % (base, urllib.parse.quote(full, safe="")))
+                else:
+                    out.append(full)
+
+            # 建索引：切片名是随机哈希 + sign，只能按真实顺序定位
+            if segs:
+                head = m3u8
+                self._seg_seq[head] = (head, 0, 0, "", None)
+                self._playlist[head] = segs
+                for _i, _u in enumerate(segs):
+                    self._seg_index[_u] = (head, _i)
+
+            body = ("\n".join(out) + "\n").encode("utf-8")
+            self._m3u8_cache[m3u8] = (time.time(), body)
+            # 变体源文本也缓存：播放器紧接着来要 m3u8 时可直接复用，
+            # 省掉"主列表 -> 变体列表"的第二次网络往返（实测省 1~2s）
+            if real != m3u8:
+                self._m3u8_cache[real + "#SRC"] = (
+                    time.time(), txt.encode("utf-8"))
+            if len(self._m3u8_cache) > 20:
+                for k in sorted(self._m3u8_cache,
+                                key=lambda x: self._m3u8_cache[x][0])[:6]:
+                    self._m3u8_cache.pop(k, None)
+
+            # 预热只做"解析"，绝不在这里下切片：
+            # 播放器几百毫秒内就会来要 m3u8，抢带宽只会让首帧变慢。
+            # 线路速度改为播放过程中由填充线程顺手统计（见 _note_speed）。
+            self.log("  prewarm 完成 %.2fs 切片%d" % (time.time()-t0, len(segs)))
+        except Exception as e:
+            self.log("prewarm 失败: %s" % e)
+        finally:
+            try:
+                ev = locals().get("ev")
+                if ev is not None:
+                    self._prewarm_evt.pop(m3u8, None)
+                    ev.set()
+            except Exception:
+                pass
+
     def playerContent(self, flag, id, vipFlags):
         play_page = id if str(id).startswith("http") else self._fix_url(id)
         self.log("player: %s" % play_page)
@@ -996,17 +1482,39 @@ class Spider(Spider):
         url = self._extract_play_url(html)
 
         if url:
+            # m3u8 走本地代理：切片并发预取，解决单连接限速导致的卡顿
+            play_url = url
+            if ".m3u8" in url.lower():
+                # 记下当前线路名：切片下载时用它统计速度（零额外开销）
+                try:
+                    self._cur_line = self._line_name(play_page)
+                except Exception:
+                    self._cur_line = ""
+                # 异步预热：下钻变体 + 预建切片映射
+                try:
+                    threading.Thread(target=self._prewarm_m3u8,
+                                     args=(url, self._cur_line),
+                                     daemon=True).start()
+                except Exception:
+                    pass
+                try:
+                    play_url = (self.getProxyUrl() or "") + "&url=" + \
+                        urllib.parse.quote(url, safe="")
+                    self.log("  => 走代理加速")
+                except Exception:
+                    play_url = url
+
             res = {
                 "parse": 0,
                 "playUrl": "",
-                "url": url,
+                "url": play_url,
                 "header": {
                     "User-Agent": UA,
                     "Referer": self.site_url + "/",
                 },
             }
             self._play_cache[play_page] = (now, res)
-            self.log("  => 直链: %s" % url[:160])
+            self.log("  => 直链: %s" % play_url[:160])
             return res
 
         # 兜底：交给 TVBox 嗅探/解析
@@ -1062,6 +1570,13 @@ class Spider(Spider):
         return False
 
     def localProxy(self, param):
+        """本地代理
+
+        两种用途：
+          1) m3u8  -> 改写播放列表：切片地址全部指向本代理，
+                      并按窗口并发预取，绕开单连接限速（这是卡顿的主因）
+          2) ts/图片 -> 直接回源；ts 命中内存缓存则秒出
+        """
         try:
             url = ""
             if isinstance(param, dict):
@@ -1077,15 +1592,221 @@ class Spider(Spider):
             if "%" in url:
                 url = urllib.parse.unquote(url)
             url = self._fix_url(url)
-            rsp = self.fetch(url, headers={
-                "User-Agent": UA, "Referer": self.site_url + "/"}, timeout=15)
-            content = rsp.content
-            ctype = rsp.headers.get("Content-Type", "image/jpeg")
-            if not ctype.startswith("image/"):
-                ctype = "image/jpeg"
-            return [200, ctype, content, ""]
-        except Exception:
+            base = self._proxy_base or ""
+
+            # ---------- m3u8：改写为代理地址 + 并发预取 ----------
+            low = url.lower().split("?")[0]
+            orig = url
+            if low.endswith(".m3u8"):
+                # 改写结果缓存 60s：同一集重开/拖动进度条时直接秒出，
+                # 不必再走"主列表 -> 变体列表"两层串行请求
+                hit = self._m3u8_cache.get(url)
+                if hit and time.time() - hit[0] < 60:
+                    self._kick_fill(url)
+                    return [200, "application/vnd.apple.mpegurl", hit[1],
+                            "Content-Type: application/vnd.apple.mpegurl\r\n"]
+
+                # 预热线程可能正在算同一个列表：等它，别重复请求
+                self._await_prewarm(url)
+
+                raw = _seg_fetch(url, timeout=15)
+                txt = raw.decode("utf-8", "ignore")
+
+                # 变体流：下钻到真正的分片列表（预热已算过就直接用）
+                if "#EXT-X-STREAM-INF" in txt:
+                    real = self._variant_of.get(url)
+                    if not real:
+                        mv = _RE_VARIANT.search(txt)
+                        if mv:
+                            real = _abs(url, mv.group(1).strip())
+                    if real:
+                        # 变体列表本身也可能已被预热放进缓存，命中则 0 开销
+                        sub_url = self._m3u8_cache.get(real + "#SRC")
+                        if sub_url:
+                            txt = sub_url[1].decode("utf-8", "ignore")
+                        else:
+                            txt = _seg_fetch(real, timeout=15).decode("utf-8", "ignore")
+                        url = real
+                        self._variant_of[orig] = real
+
+                lines = txt.splitlines()
+                out = []
+                arr = []
+                for line in lines:
+                    t = line.strip()
+                    if not t:
+                        continue
+                    if t.startswith("#"):
+                        out.append(t)
+                        continue
+                    full = _abs(url, t)
+                    arr.append(full)
+                    if base:
+                        out.append("%s&url=%s" % (
+                            base, urllib.parse.quote(full, safe="")))
+                    else:
+                        out.append(full)
+
+                # ★ 登记"真实播放列表"：该源切片名是随机哈希 + sign 签名，
+                #   无法按序号推算，必须直接按住 m3u8 的原始顺序建索引。
+                #   这是整条预取链路的地基：_roll_ahead 靠它定位"下一片"。
+                if arr:
+                    head = url
+                    self._seg_seq[head] = (head, 0, 0, "", None)
+                    self._playlist[head] = arr
+                    for _i, _u in enumerate(arr):
+                        self._seg_index[_u] = (head, _i)
+
+                # 起播预取：从第 0 片开始走水位引擎，异步不阻塞
+                if base and arr:
+                    threading.Thread(target=self._roll_ahead,
+                                     args=(arr[0],), daemon=True).start()
+
+                body = ("\n".join(out) + "\n").encode("utf-8")
+                self._m3u8_cache[url] = (time.time(), body)
+                if len(self._m3u8_cache) > 12:
+                    for k in sorted(self._m3u8_cache,
+                                    key=lambda x: self._m3u8_cache[x][0])[:4]:
+                        self._m3u8_cache.pop(k, None)
+                return [200, "application/vnd.apple.mpegurl",
+                        body, "Content-Type: application/vnd.apple.mpegurl\r\n"]
+
+            # ---------- 切片 / 图片 ----------
+            if ".ts" in low or ".m4s" in low:
+                # 命中缓存秒出，这是流畅的关键路径：填充线程已经把片备好了
+                hit = _SEG_MEM.get(url)
+                if hit and time.time() - hit[0] < 120:
+                    self._roll_ahead(url)
+                    return [200, "video/mp2t", hit[1], "Content-Type: video/mp2t\r\n"]
+
+                t0 = time.time()
+                data = _seg_fetch(url, timeout=20)
+                # 顺手记一次真实速度：只记"真正出网"的那次，命中缓存不记
+                self._note_speed(getattr(self, "_cur_line", ""),
+                                 len(data), time.time() - t0)
+                # 缺口补货：告诉填充线程"播放头到这儿了"
+                self._roll_ahead(url)
+                return [200, "video/mp2t", data, "Content-Type: video/mp2t\r\n"]
+
+            data = _http_get(url, timeout=20)
+            return [200, "image/jpeg", data, "Content-Type: image/jpeg\r\n"]
+        except Exception as e:
+            self.log("proxy ERR %s" % e)
             return [200, "image/jpeg", b"", ""]
+
+    def _kick_fill(self, m3u8):
+        """缓存命中时也要把填充线程踢一脚，否则重复打开同一集会不通水"""
+        try:
+            pl = self._playlist.get(m3u8)
+            if pl:
+                self._roll_ahead(pl[0])
+        except Exception:
+            pass
+
+    def _await_prewarm(self, m3u8):
+        """若预热线程正在处理同一个 m3u8，就等它算完（最多 8s）
+
+        预热已经发出"主列表 + 变体列表"两次请求，播放器此时若再发一遍，
+        就是纯浪费：不仅重复流量，还会让首帧多等一整轮 RTT。
+        """
+        try:
+            ev = self._prewarm_evt.get(m3u8)
+            if ev is None:
+                return
+            ev.wait(8)
+        except Exception:
+            pass
+
+    def _note_speed(self, key, nbytes, dt):
+        """播放过程中顺手统计线路速度，供下次排序用（零额外网络开销）"""
+        try:
+            if dt <= 0 or nbytes <= 0 or not key:
+                return
+            sp = (nbytes / 1024.0) / dt
+            old = _SPEED_MEM.get(key, 0.0)
+            _SPEED_MEM[key] = sp if old <= 0 else (old * 0.7 + sp * 0.3)
+        except Exception:
+            pass
+
+    def _roll_ahead(self, url):
+        """推进播放游标（索引制）
+
+        该源切片名是随机哈希 + sign 签名，**不能按序号推算下一片**，
+        所以一切以 m3u8 的真实顺序为准：先建 切片->(列表,下标) 索引，
+        再让填充线程沿下标往后取。这是整条加速链能成立的前提。
+        """
+        try:
+            info = self._seg_index.get(url)
+            if not info:
+                return
+            head, idx = info
+            playlist = self._playlist.get(head)
+            if not playlist:
+                return
+
+            st = self._fill_state.get(head)
+            if st is None:
+                st = {"idx": idx, "lock": threading.Lock(),
+                      "wake": threading.Semaphore(0), "started": False,
+                      "playlist": playlist}
+                self._fill_state[head] = st
+            # 游标只前进（拖动进度条回看时也允许后退，但要重排）
+            st["idx"] = idx
+
+            if not st["started"]:
+                st["started"] = True
+                threading.Thread(target=self._fill_worker, args=(st,),
+                                 daemon=True).start()
+            try:
+                st["wake"].release()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _fill_worker(self, st):
+        """常驻填充线程：水位控制 + 严格顺序补货
+
+        实测结论（这些数字都来自同一 CDN 的真实测量）：
+          - 单连接被限速 ~150KB/s，16 路并发可达 1400~1900KB/s；
+          - 但"整窗口无脑预取"反而更卡：并发被摊薄，播放头要的那片
+            排在队尾，起播等待从 1.2s 涨到 2.7s+。
+          - 因此改为水位制：连续库存 < _LOW_WATER 才出网，一次只补
+            _BATCH 片，且严格从缺口处按播放顺序取。播放头永远优先。
+        """
+        sem = st["wake"]
+        pl = st["playlist"]
+        total = len(pl)
+        idle = 0
+        while idle < 180:
+            try:
+                idx = st["idx"]
+                now = time.time()
+                # 从游标往后数连续库存（遇到缺口就停，跳着有缓存没意义）
+                have = 0
+                while have < _WINDOW:
+                    j = idx + have
+                    if j >= total:
+                        break
+                    hit = _SEG_MEM.get(pl[j])
+                    if not (hit and now - hit[0] < 120):
+                        break
+                    have += 1
+
+                if have >= _LOW_WATER or idx + have >= total:
+                    idle += 1
+                    sem.acquire(timeout=2)
+                    continue
+
+                idle = 0
+                start = idx + have
+                todo = [pl[k] for k in range(start, min(start + _BATCH, total))]
+                if todo:
+                    # 并发按片数放大：缺口越大越猛，但绝不进场就满负荷
+                    _concurrent_download(todo, max(4, min(_PREFETCH, len(todo) * 2)))
+            except Exception:
+                idle += 1
+                time.sleep(0.2)
 
     def destroy(self):
         pass
