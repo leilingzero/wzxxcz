@@ -368,6 +368,15 @@ _WINDOW = 30           # 预取窗口：30 片 ≈ 90s 素材
 _LOW_WATER = 14        # 连续缓冲低于 14 片（约 42s）就补货：稳态覆盖更厚
 _BATCH = 10            # 每次补货片数
 _SPEED_MEM = {}        # 线路名 -> 实测速度(KB/s)，跨片复用，避免重复测速
+_PAUSE_UNTIL = [0.0]   # 播放器优先：此时刻之前填充线程不出新流量
+
+
+def _player_first(seconds):
+    """播放头要片时把预取压住几秒，把带宽让给播放器"""
+    try:
+        _PAUSE_UNTIL[0] = max(_PAUSE_UNTIL[0], time.time() + seconds)
+    except Exception:
+        pass
 # 并发数：实测该 CDN 对单连接限死 ~150KB/s，16 路可达 1400~1900KB/s。
 # 但因为采用"水位补货"，稳态只用 8~16 路，且绝不与播放头抢带宽。
 _PREFETCH = 16
@@ -404,14 +413,39 @@ def _ascii_url(url):
     return urllib.parse.quote(url, safe=":/?#[]@!$&'()*+,;=%~")
 
 
-def _http_get(url, timeout=12, referer=""):
-    req = urllib.request.Request(_ascii_url(url), headers={
-        "User-Agent": UA,
-        "Referer": referer or HOST + "/",
-        "Accept": "*/*",
-    })
-    return urllib.request.urlopen(req, timeout=timeout,
-                                  context=_ssl_ctx()).read()
+# 无水印源的两个域名 NOT 互为镜像：换域名直接 401（鉴权绑域名）。
+# 所以这里不做域名互切，只做"同域名重试"——它的 CDN 偶发抽风
+# （连接复位/空响应/超时），重试一两次就能过。
+def _mirror_url(url):
+    """保留占位：曾经尝试过域名互切，实测 401，已废弃（不再调用）"""
+    return url
+
+
+def _http_get(url, timeout=12, referer="", retries=2):
+    """带重试的 GET。
+
+    无水印源的 CDN 会偶发抽风（连接复位/空响应/超时），
+    一次失败就把整集判死刑太冤——默认重试 2 次，间隔递增。
+    """
+    last = None
+    for i in range(retries + 1):
+        try:
+            req = urllib.request.Request(_ascii_url(url), headers={
+                "User-Agent": UA,
+                "Referer": referer or HOST + "/",
+                "Accept": "*/*",
+                "Connection": "close",
+            })
+            data = urllib.request.urlopen(req, timeout=timeout,
+                                          context=_ssl_ctx()).read()
+            if data:
+                return data
+            last = IOError("empty response")
+        except Exception as e:
+            last = e
+        if i < retries:
+            time.sleep(0.3 * (i + 1))
+    raise last
 
 
 def _abs(baseurl, seg):
@@ -1435,7 +1469,17 @@ class Spider(Spider):
             ev = threading.Event()
             self._prewarm_evt[m3u8] = ev
             t0 = time.time()
-            raw = _seg_fetch(m3u8, timeout=12)
+            raw = None
+            for _ in range(2):
+                try:
+                    raw = _seg_fetch(m3u8, timeout=12)
+                except Exception:
+                    raw = None
+                if raw:
+                    break
+                time.sleep(0.4)
+            if not raw:
+                return
             txt = raw.decode("utf-8", "ignore")
             real = m3u8
             if "#EXT-X-STREAM-INF" in txt:
@@ -1443,7 +1487,18 @@ class Spider(Spider):
                 if mv:
                     sub = _abs(m3u8, mv.group(1).strip())
                     self._variant_of[m3u8] = sub   # 先登记，让播放器能直接下钻
-                    txt = _seg_fetch(sub, timeout=12).decode("utf-8", "ignore")
+                    sub_raw = None
+                    for _ in range(3):             # 下钻层最容易抽风，多试
+                        try:
+                            sub_raw = _seg_fetch(sub, timeout=12)
+                        except Exception:
+                            sub_raw = None
+                        if sub_raw:
+                            break
+                        time.sleep(0.4)
+                    if not sub_raw:
+                        return
+                    txt = sub_raw.decode("utf-8", "ignore")
                     real = sub
 
             base = self._proxy_base or ""
@@ -1639,7 +1694,26 @@ class Spider(Spider):
                 # 预热线程可能正在算同一个列表：等它，别重复请求
                 self._await_prewarm(url)
 
-                raw = _seg_fetch(url, timeout=15)
+                # ★ 播放器优先（首帧专用）：播放器正在等 m3u8/首片时，
+                #   压住预取几秒别跟首帧抢带宽
+                _player_first(2.0)
+
+                # 主列表：CDN 抽风就多试几次（_seg_fetch 内部已按 URL 去重，
+                # 失败后重新调用会建新的去重槽，等于真重试）
+                raw = None
+                for _ in range(3):
+                    try:
+                        raw = _seg_fetch(url, timeout=15)
+                    except Exception:
+                        raw = None
+                    if raw:
+                        break
+                    time.sleep(0.4)
+                if not raw:
+                    # 502 让播放器自己重试这一集，比回一个空列表
+                    # 让它直接判"播放失败"强得多
+                    return [502, "text/plain", b"",
+                            "Content-Type: text/plain\r\n"]
                 txt = raw.decode("utf-8", "ignore")
 
                 # 变体流：下钻到真正的分片列表（预热已算过就直接用）
@@ -1655,7 +1729,20 @@ class Spider(Spider):
                         if sub_url:
                             txt = sub_url[1].decode("utf-8", "ignore")
                         else:
-                            txt = _seg_fetch(real, timeout=15).decode("utf-8", "ignore")
+                            # 下钻层也要顶住 CDN 抽风：重试 3 次
+                            sub_raw = None
+                            for _ in range(3):
+                                try:
+                                    sub_raw = _seg_fetch(real, timeout=15)
+                                except Exception:
+                                    sub_raw = None
+                                if sub_raw:
+                                    break
+                                time.sleep(0.4)
+                            if not sub_raw:
+                                return [502, "text/plain", b"",
+                                        "Content-Type: text/plain\r\n"]
+                            txt = sub_raw.decode("utf-8", "ignore")
                         url = real
                         self._variant_of[orig] = real
 
@@ -1709,8 +1796,25 @@ class Spider(Spider):
                     self._roll_ahead(url)
                     return [200, "video/mp2t", hit[1], "Content-Type: video/mp2t\r\n"]
 
+                # ★ 播放器优先只作用在首帧（m3u8 阶段）。切片请求**不能**
+                #   触发暂停：播放器是顺序拉片的，每片 miss 都暂停的话
+                #   填充线程会被永久压住，预取引擎整个失效（实测倒退回
+                #   单连接 150KB/s）。带宽协调交给下面的自适应并发档位。
                 t0 = time.time()
-                data = _seg_fetch(url, timeout=20)
+                data = None
+                for _ in range(3):
+                    try:
+                        data = _seg_fetch(url, timeout=20)
+                    except Exception:
+                        data = None
+                    if data:
+                        break
+                    time.sleep(0.4)
+                if not data:
+                    # 两次都失败：给播放器一个明确的 502，让它自己重试这一片，
+                    # 比回一坨空数据直接被判"播放失败"强
+                    return [502, "video/mp2t", b"",
+                            "Content-Type: video/mp2t\r\n"]
                 # 顺手记一次真实速度：只记"真正出网"的那次，命中缓存不记
                 self._note_speed(getattr(self, "_cur_line", ""),
                                  len(data), time.time() - t0)
@@ -1828,12 +1932,32 @@ class Spider(Spider):
                     sem.acquire(timeout=2)
                     continue
 
+                # ★ 播放器优先：播放头正在等片（缓存断档）时压住预取，
+                #   别跟播放器抢带宽。压住窗口过了就自动恢复。
+                if time.time() < _PAUSE_UNTIL[0]:
+                    sem.acquire(timeout=0.5)
+                    continue
+
                 idle = 0
                 start = idx + have
                 todo = [pl[k] for k in range(start, min(start + _BATCH, total))]
                 if todo:
-                    # 并发按片数放大：缺口越大越猛，但绝不进场就满负荷
-                    _concurrent_download(todo, max(4, min(_PREFETCH, len(todo) * 2)))
+                    # 并发自适应：限速源（如無水印，单连接 ~150KB/s）开太猛
+                    # 只会把家庭宽带打满、播放器反而挤不过去；
+                    # 按实测单连接速度降档，快源维持 16 路全速。
+                    try:
+                        spd = _SPEED_MEM.get(self._cur_line, 0.0)
+                    except Exception:
+                        spd = 0.0
+                    if spd <= 0:
+                        workers = max(4, min(_PREFETCH, len(todo) * 2))
+                    elif spd < 250:
+                        workers = 8
+                    elif spd < 600:
+                        workers = 12
+                    else:
+                        workers = _PREFETCH
+                    _concurrent_download(todo, workers)
             except Exception:
                 idle += 1
                 time.sleep(0.2)
