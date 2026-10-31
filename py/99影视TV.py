@@ -1312,19 +1312,10 @@ class Spider(Spider):
             play_url.append("#".join("%s$%s" % (n, h)
                                      for n, h in groups[sid]))
 
-        # ---- 线路测速：把快的源排到前面，并给线路名加上速度标注 ----
-        # 默认播放器取第一条线路，因此顺序 + 命名直接决定"点开能不能流畅播"
-        try:
-            ranked = self._rank_lines(order, groups, tabs)
-            if ranked:
-                play_from = [x[1] for x in ranked]
-                play_url = ["#".join("%s$%s" % (n, h) for n, h in x[2])
-                            for x in ranked]
-                self.log("  测速排序: %s" % [
-                    "%s(%dKB/s)" % (x[1], int(x[3])) for x in ranked])
-        except Exception as e:
-            self.log("  测速失败(忽略): %s" % e)
-
+        # 线路顺序严格与网站一致，不做任何重排、不在线路名上加标注。
+        # （早期版本曾按实测速度重排并把速度拼进线路名，显示成
+        #   "DY·1920KB/s" 这种怪异样子，且破坏了站点的线路顺序，
+        #   已废弃；测速数据只留给内部预取调度用，不上屏。）
         result = {
             "vod_id": vod_id,
             "vod_name": name,
@@ -1347,38 +1338,6 @@ class Spider(Spider):
     # ------------------------------------------------------------------
     # 播放
     # ------------------------------------------------------------------
-    def _rank_lines(self, order, groups, tabs):
-        """按"历史测速评分"给线路排序，让快源排在前面
-
-        不在详情页里现场测速：那样每次打开详情都要多花 5~8 秒，
-        而且会把带宽占满、拖慢紧接着的起播。
-        改为：播放时顺手记录每条线路的实测速度（_SPEED_MEM，进程内共享），
-        之后打开别的片时就能直接用历史评分排序，零额外开销。
-        """
-        try:
-            scored = []
-            for i, sid in enumerate(order):
-                name = tabs[i] if i < len(tabs) else ("线路%d" % (i + 1))
-                host = ""
-                try:
-                    host = urllib.parse.urlparse(groups[sid][0][1]).netloc
-                except Exception:
-                    pass
-                sp = _SPEED_MEM.get(name, 0.0)
-                scored.append((i, sid, name, groups[sid], sp, host))
-            # 有评分的按速度降序在前；没评分的保持原顺序在后
-            known = sorted([x for x in scored if x[4] > 0], key=lambda x: -x[4])
-            unknown = [x for x in scored if x[4] <= 0]
-            out = []
-            for x in known + unknown:
-                tag = x[2]
-                if x[4] > 0:
-                    tag = "%s·%dKB/s" % (x[2], int(x[4]))
-                out.append((x[1], tag, x[3], x[4]))
-            return out
-        except Exception:
-            return None
-
     def _line_name(self, play_page):
         """从播放页地址推线路名：/userpy/{slug}-{线路序号}-{集数}.html
 
