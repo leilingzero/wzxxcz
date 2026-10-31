@@ -170,6 +170,35 @@ def _t2s(text):
     return "".join(_TO_SIMP.get(c, c) for c in text)
 
 
+# JS 的 escape()/旧版 encodeURIComponent() 会产生 %uXXXX 这种非标准转义，
+# urllib.parse.unquote 只认 %XX，会把 %u7B2C 原样留下 -> 服务器 400。
+# 站内有源（如 c1.rrcdnbf4.com/video/wanjieduzun/%u7B2C01%u96C6/index.m3u8）
+# 就是这么转义的，必须先在 "第" 这个层级解掉。
+_RE_UESC = re.compile(r"%u([0-9a-fA-F]{4})")
+
+
+def _unquote_js(url):
+    """解码 URL：先处理 JS 风格 %uXXXX，再按标准 %XX 解码。
+
+    注意顺序：必须先把 %uXXXX 换成真正的字符，否则后续 unquote 会把
+    "%u7B2C" 里的 "%7B" 当成 "{" 解掉，拼出乱码地址。
+    """
+    if not url:
+        return ""
+    s = url
+    # %uXXXX -> 字符；两轮足以处理极少数二次转义
+    for _ in range(2):
+        if "%u" not in s.lower():
+            break
+        s = _RE_UESC.sub(lambda m: chr(int(m.group(1), 16)), s)
+    # 仅解码一次：已解出的中文再解会破坏（如 %E7%AC%AC 才需要解）
+    try:
+        s = urllib.parse.unquote(s)
+    except Exception:
+        pass
+    return s
+
+
 
 # 四大主分类 -> 拼音段（type 为空时使用该段作为默认值）
 CLASSES = [
@@ -298,6 +327,9 @@ _RE_EP = re.compile(
     r'<a class="module-play-list-link"\s+href="([^"]+)"[^>]*>\s*'
     r'<span>([^<]*)</span>', re.I)
 
+# 单条线路的剧集容器（站内多个 panel 都复用 id="panel1"，按出现顺序切块）
+_RE_PANEL = re.compile(r'<div class="module-list[^"]*"', re.I)
+
 # 播放页
 _RE_PLAYER = re.compile(r'var\s+player_aaaa\s*=\s*(\{[\s\S]*?\})\s*</script>', re.I)
 
@@ -356,8 +388,24 @@ def _ssl_ctx():
     return _SSL_CTX
 
 
+def _ascii_url(url):
+    """把含中文等非 ASCII 字符的 URL 重新做 percent-encoding。
+
+    站内有源把集数写在中文明文路径里（.../video/wanjieduzun/第01集/index.m3u8），
+    http.client 只吃 ASCII，直接把 str 塞进去会抛
+    "'ascii' codec can't encode character ..."。这里保留已有的 %XX
+    和 URL 结构字符，只转义非 ASCII 部分。
+    """
+    try:
+        url.encode("ascii")
+        return url
+    except UnicodeEncodeError:
+        pass
+    return urllib.parse.quote(url, safe=":/?#[]@!$&'()*+,;=%~")
+
+
 def _http_get(url, timeout=12, referer=""):
-    req = urllib.request.Request(url, headers={
+    req = urllib.request.Request(_ascii_url(url), headers={
         "User-Agent": UA,
         "Referer": referer or HOST + "/",
         "Accept": "*/*",
@@ -1268,49 +1316,72 @@ class Spider(Spider):
             content = INTRO_PREFIX
 
         # ===== 线路与剧集 =====
+        # 站点的「标签线路」与「剧集列表」是两段独立输出：
+        #   <div class="module-tab-item tab-item" data-dropdown-value="DY"><span>DY</span><small>538</small></div>
+        #   ...（逐条 tab）
+        #   <div class="module-list ..." id="panel1"><a class="module-play-list-link" href="/userpy/{slug}-3-1.html">
+        #   ...（每个 tab 对应一个 panel，panel 的出现顺序 = tab 顺序）
+        #
+        # 注意：/userpy/{slug}-{n}-{ep}.html 里的 n **不是**界面顺序，
+        # 例如 7 条线时 tab 顺序是 DY,BY,LY,SY,WY,RY,無水印，
+        # 而 n 依次是 5,1,2,3,4,6,7（甚至 1..7 混排）。
+        # 早先版本用「第 i 个 tab 配第 i 个 n」的位置猜测，电视剧碰巧对得上，
+        # 综艺/动漫的 n 顺序是乱的，配错后 线路名↔剧集 完全错位，
+        # 点开某一线路拿到的地址属于另一条源 -> 播放直接失败。
+        #
+        # 正确做法：以 panel 为单位切块，panel 内第一个链接的 n 就是该 tab
+        # 真正对应的站内序号；顺序严格取 tab 顺序（= panel 顺序），
+        # 与网站界面完全一致。
         tabs = []
         for m in _RE_TAB.finditer(html):
             tname = self._clean(m.group(2))
             if tname:
                 tabs.append(tname)
 
-        eps = _RE_EP.findall(html)
+        # 按 panel 切块（每块只含一条线路的剧集）
+        blocks = []
+        cuts = [m.start() for m in _RE_PANEL.finditer(html)]
+        if cuts:
+            cuts.append(len(html))
+            for i in range(len(cuts) - 1):
+                seg = html[cuts[i]:cuts[i + 1]]
+                items = []
+                for href, ep_name in _RE_EP.findall(seg):
+                    href = href.replace("&amp;", "&")
+                    items.append((self._clean(ep_name) or "正片",
+                                  self._fix_url(href)))
+                if items:
+                    blocks.append(items)
+        if not blocks:
+            # 兜底：没有 panel 结构时，按链接出现顺序整体成一条线路
+            items = []
+            for href, ep_name in _RE_EP.findall(html):
+                href = href.replace("&amp;", "&")
+                items.append((self._clean(ep_name) or "正片",
+                              self._fix_url(href)))
+            if items:
+                blocks.append(items)
+
         self.log("  标签线路: %s" % tabs)
-        self.log("  剧集链接: %d" % len(eps))
+        self.log("  剧集块: %d 组 / 共 %d 集"
+                 % (len(blocks), sum(len(b) for b in blocks)))
 
-        if not eps:
+        if not blocks:
             return {"list": []}
-
-        # 按 sid 分组（/userpy/{slug}-{sid}-{nid}.html）
-        groups = {}
-        order = []
-        for href, ep_name in eps:
-            href = href.replace("&amp;", "&")
-            mm = re.search(r"-(\d+)-(\d+)\.html", href)
-            if mm:
-                sid = mm.group(1)
-            else:
-                sid = "0"
-            if sid not in groups:
-                groups[sid] = []
-                order.append(sid)
-                # 记录站内序号 -> 线路名（线路名按出现顺序对应 tabs）
-                _i = len(order) - 1
-                if _i < len(tabs):
-                    self._sid_name[sid] = tabs[_i]
-            groups[sid].append((self._clean(ep_name) or "正片",
-                                self._fix_url(href)))
 
         play_from = []
         play_url = []
-        for i, sid in enumerate(order):
+        for i, items in enumerate(blocks):
             if i < len(tabs):
                 alias = tabs[i]
             else:
                 alias = "线路%d" % (i + 1)
+            # 记下站内序号 -> 线路名，供播放页反查（_line_name）
+            mm = re.search(r"-(\d+)-\d+\.html", items[0][1])
+            if mm:
+                self._sid_name[mm.group(1)] = alias
             play_from.append(alias)
-            play_url.append("#".join("%s$%s" % (n, h)
-                                     for n, h in groups[sid]))
+            play_url.append("#".join("%s$%s" % (n, h) for n, h in items))
 
         # 线路顺序严格与网站一致，不做任何重排、不在线路名上加标注。
         # （早期版本曾按实测速度重排并把速度拼进线路名，显示成
@@ -1504,7 +1575,7 @@ class Spider(Spider):
             if not mm:
                 return ""
             val = mm.group(1)
-            return urllib.parse.unquote(
+            return _unquote_js(
                 val.replace("\\/", "/").replace("\\u0026", "&"))
 
         val = data.get("url") or ""
@@ -1512,8 +1583,8 @@ class Spider(Spider):
             return ""
 
         val = val.replace("\\/", "/").replace("\\u0026", "&")
-        if val.startswith("%") or "%2F" in val or "%3A" in val:
-            val = urllib.parse.unquote(val)
+        if "%" in val:
+            val = _unquote_js(val)
         if val.startswith("//"):
             val = "https:" + val
         if val.startswith("/"):
@@ -1549,7 +1620,7 @@ class Spider(Spider):
             if not url:
                 return [200, "image/jpeg", b"", ""]
             if "%" in url:
-                url = urllib.parse.unquote(url)
+                url = _unquote_js(url)
             url = self._fix_url(url)
             base = self._proxy_base or ""
 
