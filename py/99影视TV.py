@@ -1,6 +1,6 @@
 # coding=utf-8
 """
-99影视TV 99itv.cc | TVBox Python 爬虫 
+99影视TV 99itv.cc | TVBox Python 爬虫 (V1.0)
 站点结构:
   - 首页        /                                   (多板块卡片)
   - 分类首页    /type/{movie|drama|variety|anime}.html
@@ -174,6 +174,9 @@ _YEARS = [{"n": "全部", "v": ""}] + \
          [{"n": str(y), "v": str(y)} for y in range(2026, 1999, -1)]
 
 # 类型段（即 /show/{type}... 的第一段）
+# 说明：站点筛选里"類型-全部"的链接是 /show/1------.html、/show/2------.html ...
+#      与 /show/movie------.html 结果一致，两者等价；这里用站点原文的数字段，
+#      保证与网站链接逐字一致。
 _TYPES = {
     "movie": [
         ("1", "全部"), ("action", "动作片"), ("comedys", "喜剧片"),
@@ -198,7 +201,7 @@ _TYPES = {
     ],
 }
 
-# 地区段（必须与站点原文一致：繁体）
+# 地区段（必须与站点原文一致：繁体，顺序亦同）
 _AREAS = {
     "movie": ["大陸", "香港", "台灣", "美國", "韓國", "日本", "泰國",
               "印度", "英國", "法國", "德國", "加拿大", "西班牙",
@@ -211,17 +214,19 @@ def _build_filters():
     out = {}
     for c in CLASSES:
         tid = c["type_id"]
-        type_val = [{"n": n, "v": "" if v in ("1", "2", "3", "4") else v}
-                    for v, n in _TYPES.get(tid, [])]
+        # 类型：站点用数字段表示"全部"（1/2/3/4），这里原样保留
+        type_val = [{"n": n, "v": v} for v, n in _TYPES.get(tid, [])]
 
+        # 地区：站点"全部"= 省略地区段
         area_val = [{"n": "全部", "v": ""}]
         for a in _AREAS.get(tid, []):
             area_val.append({"n": a, "v": a})
 
+        # 顺序与站点完全一致：類型 → 地區 → 年份 → 排序
         flt = [
             {"key": "class", "name": "类型", "value": type_val},
-            {"key": "sort",  "name": "排序", "value": _SORTS},
             {"key": "year",  "name": "年份", "value": _YEARS},
+            {"key": "sort",  "name": "排序", "value": _SORTS},
         ]
         if tid in _AREAS:
             flt.insert(1, {"key": "area", "name": "地区", "value": area_val})
@@ -281,12 +286,13 @@ _RE_EP = re.compile(
 _RE_PLAYER = re.compile(r'var\s+player_aaaa\s*=\s*(\{[\s\S]*?\})\s*</script>', re.I)
 
 # 分页
+# href 与 class 的顺序在站内并不固定，这里统一放宽为"同一 <a ...> 标签内"
 _RE_NEXT = re.compile(
-    r'href="([^"]*)"\s+class="page-link page-next"[^>]*title="下一頁"', re.I)
+    r'<a\s[^>]*href="([^"]*)"[^>]*>\s*下一[頁页]', re.I)
 _RE_LAST = re.compile(
-    r'href="([^"]*)"\s+class="page-link page-next"[^>]*title="尾頁"', re.I)
+    r'<a\s[^>]*href="([^"]*)"[^>]*>\s*尾[頁页]', re.I)
 _RE_PAGE_NUM = re.compile(
-    r'class="page-link page-number[^"]*"[^>]*title="第(\d+)頁"', re.I)
+    r'<a\s[^>]*href="([^"]*)"[^>]*page-number[^>]*>\s*(\d+)\s*</a>', re.I)
 
 # 路径解析: /show/{type}-{area}--{page}-{sort}--{year}.html
 _RE_SHOW_PATH = re.compile(r'/show/([^/]*?)\.html$', re.I)
@@ -497,7 +503,7 @@ class Spider(Spider):
         if not html:
             return int(pg)
         mx = 0
-        for p in _RE_PAGE_NUM.findall(html):
+        for _u, p in _RE_PAGE_NUM.findall(html):
             try:
                 mx = max(mx, int(p))
             except Exception:
@@ -535,21 +541,42 @@ class Spider(Spider):
         return {"list": videos}
 
     def _build_show_url(self, tid, extend, page):
-        """拼装 /show/{type}-{area}-{page}-{sort}-{year}.html"""
+        """拼装 /show/{type}-{area}-{page}-{sort}-{year}.html
+
+        该站 URL 固定 7 段（用 - 切分）：
+            [类型] [地区] [''] [页码] [排序] [''] [年份]
+        站点会自动省略"默认值"对应的段，以下为逐条抓取站点自身链接得到的规则：
+
+            默认      /show/movie------.html
+            类型      /show/china------.html
+            年份      /show/drama------2024.html
+            排序      /show/drama----hits--.html
+            地区      /show/movie-%E5%A4%A7%E9%99%B8-----.html
+            分页      /show/movie---2---.html
+            组合      /show/movie-%E5%A4%A7%E9%99%B8--2-hits--2024.html
+
+        关键点：**只有"地区/类型 + 排序"同时出现时才会写 sort 段**；
+        纯分页（/show/movie---2---.html）与"仅年份"都不写 sort。
+        多写一段会导致该站返回 0 条，这是之前排序错乱的根因。
+        """
         type_seg = (extend.get("class") or "").strip() or \
                    {"movie": "movie", "drama": "drama",
                     "variety": "variety", "anime": "anime"}.get(tid, "movie")
         area = (extend.get("area") or "").strip()
-        sort = (extend.get("sort") or "").strip() or "time"
+        sort = (extend.get("sort") or "").strip()
         year = (extend.get("year") or "").strip()
 
         area_seg = urllib.parse.quote(area, safe="") if area else ""
         page_seg = str(page) if int(page) > 1 else ""
-        sort_seg = sort if sort != "time" else ""
 
-        # 站内 URL 固定结构（用 - 切分共 7 段）:
-        #   type - area - '' - page - sort - '' - year
-        # 即: {type}-{area}--{page}-{sort}--{year}.html
+        # 排序段：站点仅在"非时间排序"或"已选地区"时才显式写
+        if sort and sort != "time":
+            sort_seg = sort
+        elif area_seg:
+            sort_seg = "time"
+        else:
+            sort_seg = ""
+
         return "%s/show/%s-%s--%s-%s--%s.html" % (
             self.site_url, type_seg, area_seg, page_seg, sort_seg, year)
 
