@@ -15,7 +15,7 @@
   3) init 只做本地初始化; 登录/取二级公钥改懒加载, 失败 60s 后可重试
   4) 简介统一加 INTRO_PREFIX; 集名 "第01集"->"01"; 线路按 _line_rank 排序
 
-V7.1 增量(短剧/筛选/地址编码):
+ 增量(短剧/筛选/地址编码):
   5) 短剧 fn=29 结构: 一条记录 = 一条线路的一个播放位置。单条线路(短剧"全集"、
      单片) 统一显示为「正片」, 避免 TVBox 显示成 "1"; 备注优先用站点原文(全47集)
   6) 列表条目补全 vod_year(fn14)/vod_area(fn1)/vod_director(fn7)/vod_actor(fn12),
@@ -316,6 +316,21 @@ _RE_ANY_URL = re.compile(rb'https?://[\x21-\x7e]+')
 _RE_IMG_EXT = re.compile(
     r'(?i)(\.(?:jpg|jpeg|png|webp|gif|bmp|svg|image)(?:\?|$)|'
     r'/+image\.image|tplv-[a-z0-9]+-image)')
+
+# 分类黑名单: 文章(27) 与 最近在看/在线观看 不上首页
+_SKIP_CAT_ID = ('27', '29')
+_SKIP_CAT_NAME = ('文章', '最近在看', '在线观看', '观看记录')
+
+
+def _cat_skip(tid, name):
+    if str(tid) in _SKIP_CAT_ID:
+        return True
+    n = str(name or '').strip()
+    for kw in _SKIP_CAT_NAME:
+        if kw in n:
+            return True
+    return False
+
 
 _SORT_MAP = {'最新': 'time', '最热': 'hits', '好评': 'score'}
 _DEF_FILTERS = {
@@ -837,7 +852,8 @@ class Spider(_Base):
             j = self._json(base + '/api/v3/drama/getCategory?orderBy=type_id')
             for c in (j.get('data') or []):
                 tid = str(c.get('id') or '')
-                if not tid or tid == '29':
+                nm = c.get('name') or tid
+                if not tid or _cat_skip(tid, nm):
                     continue
                 raw = c.get('converUrl') or ''
                 filt = {}
@@ -849,7 +865,7 @@ class Spider(_Base):
                     except Exception:
                         filt = {}
                 cats.append({'type_id': tid,
-                             'type_name': c.get('name') or tid,
+                             'type_name': nm,
                              'filter': filt or {}})
             if cats:
                 break
@@ -857,7 +873,7 @@ class Spider(_Base):
             cats = [{'type_id': t, 'type_name': n, 'filter': {}}
                     for t, n in [('20', '电影'), ('21', '剧集'), ('22', '综艺'),
                                  ('23', '动漫'), ('24', '短剧'), ('25', '直播'),
-                                 ('26', '漫剧'), ('27', '')]]
+                                 ('26', '漫剧')]]
         _CAT_CACHE['data'] = cats
         _CAT_CACHE['ts'] = now
         return cats
@@ -887,7 +903,6 @@ class Spider(_Base):
             cats = self._load_cats()
             classes = [{'type_id': c['type_id'], 'type_name': c['type_name']}
                        for c in cats]
-            classes.append({'type_id': 'history', 'type_name': ''})
             filters = {c['type_id']: self._build_filters(c['filter'],
                                                          c['type_id'])
                        for c in cats}
@@ -895,7 +910,7 @@ class Spider(_Base):
             return {'class': classes, 'filters': filters}
         except Exception as e:
             self.log('homeContent 失败: %s' % e)
-            return {'class': [{'type_id': 'history', 'type_name': ''}],
+            return {'class': [{'type_id': '20', 'type_name': '电影'}],
                     'filters': {}}
 
     def homeVideoContent(self):
