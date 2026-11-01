@@ -23,6 +23,8 @@
   7) 线路排序: 直链蓝光/4K 在前, BL/QQ/YK/QY 等纯站代号(网页解析源)垫底
   8) 中文路径百分号编码 _q_url(): p.b8bf.com/.../全集/index.m3u8 直接请求会 404
   9) 解析源回传图床封面(~image.image / tplv-xxx-image)判定失败, 不再当播放地址
+ 10) 首页分类只剔除「文章」(id=27), 保留 电影/剧集/综艺/动漫/短剧/直播/漫剧;
+     不再追加「最近在看」入口 (history 分支保留, 只是不挂首页)
 """
 import re
 import sys
@@ -317,9 +319,10 @@ _RE_IMG_EXT = re.compile(
     r'(?i)(\.(?:jpg|jpeg|png|webp|gif|bmp|svg|image)(?:\?|$)|'
     r'/+image\.image|tplv-[a-z0-9]+-image)')
 
-# 分类黑名单: 文章(27) 与 最近在看/在线观看 不上首页
+# 首页分类: 保留站点的 电影/剧集/综艺/动漫/短剧/直播/漫剧, 只剔除「文章」
+# 文章 id=27, 另有 29 为隐藏类目
 _SKIP_CAT_ID = ('27', '29')
-_SKIP_CAT_NAME = ('文章', '最近在看', '在线观看', '观看记录')
+_SKIP_CAT_NAME = ('文章',)
 
 
 def _cat_skip(tid, name):
