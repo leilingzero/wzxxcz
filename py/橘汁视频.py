@@ -857,7 +857,7 @@ class Spider(_Base):
             cats = [{'type_id': t, 'type_name': n, 'filter': {}}
                     for t, n in [('20', '电影'), ('21', '剧集'), ('22', '综艺'),
                                  ('23', '动漫'), ('24', '短剧'), ('25', '直播'),
-                                 ('26', '漫剧'), ('27', '文章')]]
+                                 ('26', '漫剧'), ('27', '')]]
         _CAT_CACHE['data'] = cats
         _CAT_CACHE['ts'] = now
         return cats
@@ -887,7 +887,7 @@ class Spider(_Base):
             cats = self._load_cats()
             classes = [{'type_id': c['type_id'], 'type_name': c['type_name']}
                        for c in cats]
-            classes.append({'type_id': 'history', 'type_name': '最近在看'})
+            classes.append({'type_id': 'history', 'type_name': ''})
             filters = {c['type_id']: self._build_filters(c['filter'],
                                                          c['type_id'])
                        for c in cats}
@@ -895,7 +895,7 @@ class Spider(_Base):
             return {'class': classes, 'filters': filters}
         except Exception as e:
             self.log('homeContent 失败: %s' % e)
-            return {'class': [{'type_id': 'history', 'type_name': '最近在看'}],
+            return {'class': [{'type_id': 'history', 'type_name': ''}],
                     'filters': {}}
 
     def homeVideoContent(self):
